@@ -225,12 +225,12 @@ class Echeveste2020(SKNMSIMethodABC):
     def __init__(
         self,
         *,
-        N_E=50,  # Número de neuronas excitatorias 
-        N_I=50,  # Número de neuronas inhibitorias 
-        tau_e=20.0,  # ms - Constante de tiempo excitatorias 
+        N_E=50,  # Número de neuronas excitatorias
+        N_I=50,  # Número de neuronas inhibitorias
+        tau_e=20.0,  # ms - Constante de tiempo excitatorias
         tau_i=10.0,  # ms - Constante de tiempo inhibitorias
-        n=2.0,  # Exponente supralineal de Eq. 9 
-        k=0.3,  # Factor de escala de Eq. 9 
+        n=2.0,  # Exponente supralineal de Eq. 9
+        k=0.3,  # Factor de escala de Eq. 9
         seed=None,  # Semilla para generador aleatorio
         position_range=(
             0,
@@ -257,9 +257,31 @@ class Echeveste2020(SKNMSIMethodABC):
         # Estructura básica de la red
         self._N_E = N_E  # Número de neuronas excitatorias
         self._N_I = N_I  # Número de neuronas inhibitorias
+
+        # Parámetros de conectividad parametrica - Eq. 10 del paper
+        # Stage 1 optimization: optimize these 8 connectivity parameters
+        self._a_EE = None  # Amplitud excitatorio-excitatorio
+        self._a_EI = None  # Amplitud excitatorio-inhibitorio
+        self._a_IE = None  # Amplitud inhibitorio-excitatorio
+        self._a_II = None  # Amplitud inhibitorio-inhibitorio
+        self._d_EE = None  # Ancho excitatorio-excitatorio
+        self._d_EI = None  # Ancho excitatorio-inhibitorio
+        self._d_IE = None  # Ancho inhibitorio-excitatorio
+        self._d_II = None  # Ancho inhibitorio-inhibitorio
+
+        # Storage for computed connectivity matrices
+        self._W_EE = None  # Matriz de conectividad E-E
+        self._W_EI = None  # Matriz de conectividad E-I
+        self._W_IE = None  # Matriz de conectividad I-E
+        self._W_II = None  # Matriz de conectividad I-I
+
+        # Training state tracking
+        self._is_trained = False
+        self._stage1_completed = False
+        self._stage2_completed = False
         self._N = N_E + N_I  # Total de neuronas en ring topology
 
-        # Parámetros espaciales y temporales 
+        # Parámetros espaciales y temporales
         self._position_range = position_range  # Rango orientaciones [0°, 180°]
         self._position_res = position_res  # Resolución angular (3.6°)
         self._time_range = time_range  # Duración simulación (1000ms)
@@ -276,8 +298,8 @@ class Echeveste2020(SKNMSIMethodABC):
 
         # Inicializa integrador SSN con parámetros optimizados (Supp. Table S1)
         integrator_model = SSNIntegrator(
-            tau_e=tau_e / 1000.0,  # Convierte τ_E = 20ms a segundos
-            tau_i=tau_i / 1000.0,  # Convierte τ_I = 10ms a segundos
+            tau_e=tau_e / 1000.0, 
+            tau_i=tau_i / 1000.0, 
             n=n,  # Exponente supralineal n = 2.0 (Eq. 9)
             k=k,  # Factor de escala k = 0.3 (Eq. 9)
         )
@@ -288,6 +310,316 @@ class Echeveste2020(SKNMSIMethodABC):
         self.set_random(
             np.random.default_rng(seed=seed)
         )  # RNG para ruido η (Supp. Sec. 2.3)
+
+    def train(self, gsm_model, stage1_params=None, stage2_params=None):
+        """
+        Train the SSN model following the two-stage optimization from Echeveste et al. (2020).
+
+        The GSM (Gaussian Scale Mixture) generative model must be pre-trained.
+        The SSN learns to perform sampling-based inference on this GSM.
+
+        Based on Main paper, página 15: "Sampling-based inference optimization"
+        - Stage 1: Optimize connectivity parameters (8 parameters from Eq. 10)
+        - Stage 2: Optimize other network parameters (stimuli gain, noise, etc.)
+
+        Parameters
+        ----------
+        gsm_model : object
+            Pre-trained GSM generative model containing:
+            - Gabor filters (receptive fields A)
+            - Prior parameters for z and G
+            - Trained parameters from natural image statistics
+        stage1_params : dict, optional
+            Parameters specific to Stage 1 optimization
+        stage2_params : dict, optional
+            Parameters specific to Stage 2 optimization
+
+        Returns
+        -------
+        dict
+            Training results with optimized parameters and convergence metrics
+        """
+        # Validate GSM model structure
+        if not self._validate_gsm_model(gsm_model):
+            raise ValueError("Invalid pre-trained GSM model")
+
+        # Stage 1: Optimize connectivity parameters (Eq. 10)
+        # Main paper, página 15: First optimize recurrent connectivity
+        stage1_results = self._optimize_stage1(gsm_model, stage1_params)
+        self._stage1_completed = True
+
+        # Stage 2: Optimize remaining parameters
+        # Main paper, página 16: Then optimize stimulus and noise parameters
+        stage2_results = self._optimize_stage2(gsm_model, stage2_params)
+        self._stage2_completed = True
+
+        # Build final connectivity matrices from optimized parameters
+        self._build_connectivity_matrices()
+        self._is_trained = True
+
+        return {
+            "stage1": stage1_results,
+            "stage2": stage2_results,
+            "connectivity_params": self._get_connectivity_parameters(),
+            "convergence_info": self._get_convergence_info(),
+        }
+
+    # TODO revisar mucha IA
+    def _validate_gsm_model(self, gsm_model):
+        """
+        Validate pre-trained GSM generative model structure.
+
+        Based on Main paper, Eq. 1-7: GSM generative model must be
+        pre-trained on natural images before SSN inference optimization.
+        The GSM provides the generative model that the SSN learns to invert.
+        """
+        required_attributes = [
+            "gabor_filters",
+            "scale_prior_params",
+            "gaussian_field_params",
+        ]
+        return all(hasattr(gsm_model, attr) for attr in required_attributes)
+
+    def _optimize_stage1(self, gsm_model, params):
+        """
+        Stage 1: Optimize recurrent connectivity kernel using Eq. 10.
+
+        In this first stage, the network is trained to approximate the GSM posterior
+        by adjusting only the 8 kernel parameters {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}.
+        These parameters define the shape of the recurrent connectivity matrix W via
+        a circular Gaussian function of orientation difference:
+
+            W_XY(θi, θj) = a_XY * exp((cos(2(θi - θj)) - 1) / d_XY²)
+
+        Main paper, Eq. 10.
+
+        The optimization minimizes the loss defined in Eq. 25 (moment-matching between
+        network activity and GSM posterior statistics) using stochastic simulations of
+        the dynamics (Eq. 8) with noise. Gradients are estimated via backpropagation
+        through time, and parameters are updated using the ADAM optimizer.
+
+        During training, the burn-in window Tmin is annealed to enforce rapid convergence
+        of the network dynamics.
+
+        Parameters
+        ----------
+        gsm_model : object
+            Pre-trained GSM generative model defining the target posterior statistics.
+        params : dict
+            Stage 1 specific parameters (optimizer settings, number of trials, constraints, etc.)
+
+        Returns
+        -------
+        dict
+            Optimization results for Stage 1 (final kernel parameters, loss trajectory, etc.)
+        """
+        # TODO: Implementar optimización de 8 parámetros de conectividad
+        # Objetivo: SSN debe generar muestras que coincidan con posterior P(z,G|I) del GSM
+        # Usa training data generada por GSM: imagen I -> posterior target P(z,G|I)
+        pass
+
+    def _optimize_stage2(self, gsm_model, params):
+        """
+        Stage 2: Fine-tune recurrent and additional network parameters using Eq. 25.
+
+        After Stage 1 has set the coarse recurrent structure via parametric kernel (Eq. 10),
+        Stage 2 expands the optimization to include additional network parameters such as
+        feedforward gains, neuronal time constants, and noise covariance terms.
+
+        Main paper, Eq. 25: loss = weighted sum of moment-matching penalties
+        (mean, variance, covariance, and slowness terms) between network activity
+        and the target GSM posterior statistics.
+
+        The optimization in Stage 2 uses a deterministic moment-closure method
+        (Assumed Density Filtering, Eqs. 17–20) to compute network moments without
+        sampling noise, and employs the L-BFGS-B optimizer for stable convergence.
+
+        Parameters
+        ----------
+        gsm_model : object
+            Pre-trained GSM generative model
+        params : dict
+            Stage 2 specific parameters
+
+        Returns
+        -------
+        dict
+            Optimization results for Stage 2
+        """
+        # TODO: Implementar optimización de parámetros de estímulo y ruido
+        # Objetivo: optimizar parámetros no relacionados con conectividad para mejor inferencia
+        pass
+
+    def _build_connectivity_matrices(self):
+        """
+        Build full connectivity matrices from optimized parameters.
+
+        Uses the optimized 8 parameters to compute full W matrices via Eq. 10.
+        This follows the hybrid approach: store both parameters and matrices.
+        """
+        if not self._stage1_completed:
+            raise ValueError(
+                "Stage 1 must be completed before building matrices"
+            )
+
+        # Generate orientation vectors for ring topology
+        orientations = np.linspace(0, np.pi, self._N, endpoint=False)
+        # Alternativa de cálculo: orientations = np.pi * np.arange(self._N) / self._N
+
+        # Build matrices using parametric connectivity
+        self._W_EE = self._build_parametric_matrix(
+            orientations[: self._N_E],
+            orientations[: self._N_E],
+            self._a_EE,
+            self._d_EE,
+        )
+        self._W_EI = self._build_parametric_matrix(
+            orientations[: self._N_E],
+            orientations[self._N_E :],
+            self._a_EI,
+            self._d_EI,
+        )
+        self._W_IE = self._build_parametric_matrix(
+            orientations[self._N_E :],
+            orientations[: self._N_E],
+            self._a_IE,
+            self._d_IE,
+        )
+        self._W_II = self._build_parametric_matrix(
+            orientations[self._N_E :],
+            orientations[self._N_E :],
+            self._a_II,
+            self._d_II,
+        )
+
+    def _build_parametric_matrix(self, theta_pre, theta_post, a_xy, d_xy):
+        """
+        Build connectivity matrix using parametric formula from Eq. 10.
+
+        Parameters
+        ----------
+        theta_pre : np.ndarray
+            Orientations of pre-synaptic neurons
+        theta_post : np.ndarray
+            Orientations of post-synaptic neurons
+        a_xy : float
+            Amplitude parameter
+        d_xy : float
+            Width parameter
+
+        Returns
+        -------
+        np.ndarray
+            Connectivity matrix computed from parametric formula
+        """
+        matrix = np.zeros((len(theta_post), len(theta_pre)))
+        for i, theta_i in enumerate(theta_post):
+            for j, theta_j in enumerate(theta_pre):
+                matrix[i, j] = self.parametric_connectivity(
+                    theta_i, theta_j, a_xy, d_xy
+                )
+        return matrix
+
+    def _get_connectivity_parameters(self):
+        """Return dictionary of 8 connectivity parameters."""
+        return {
+            "a_EE": self._a_EE,
+            "a_EI": self._a_EI,
+            "a_IE": self._a_IE,
+            "a_II": self._a_II,
+            "d_EE": self._d_EE,
+            "d_EI": self._d_EI,
+            "d_IE": self._d_IE,
+            "d_II": self._d_II,
+        }
+
+    def _get_convergence_info(self):
+        """Return convergence information from training stages."""
+        return {
+            "stage1_completed": self._stage1_completed,
+            "stage2_completed": self._stage2_completed,
+            "is_trained": self._is_trained,
+        }
+
+    def save_parameters(self, output_path):
+        """
+        Save optimized parameters following Echeveste's approach.
+
+        Saves both the 8 parametric values and computed full matrices,
+        matching the structure found in ssn_inference_numerical_experiments.
+
+        Parameters
+        ----------
+        output_path : str
+            Directory path to save parameters
+        """
+        if not self._is_trained:
+            raise ValueError("Model must be trained before saving parameters")
+
+        # Save 8 parametric connectivity parameters (scalar files)
+        params = self._get_connectivity_parameters()
+        for param_name, param_value in params.items():
+            np.savetxt(
+                f"{output_path}/w_{param_name.lower()}_learn", [param_value]
+            )
+
+        # Save full connectivity matrices
+        full_W = self.build_connectivity_matrix()
+        np.savetxt(f"{output_path}/w_learn", full_W)
+
+    def load_parameters(self, input_path):
+        """
+        Load pre-trained parameters from files.
+
+        Can load either from parametric files or full matrix,
+        following Echeveste's dual storage approach.
+        """
+        try:
+            # Try loading parametric parameters first
+            params = {}
+            for param in [
+                "a_ee",
+                "a_ei",
+                "a_ie",
+                "a_ii",
+                "d_ee",
+                "d_ei",
+                "d_ie",
+                "d_ii",
+            ]:
+                params[param] = np.loadtxt(f"{input_path}/w_{param}_learn")
+
+            # Set parametric values
+            self._a_EE = params["a_ee"]
+            self._a_EI = params["a_ei"]
+            self._a_IE = params["a_ie"]
+            self._a_II = params["a_ii"]
+            self._d_EE = params["d_ee"]
+            self._d_EI = params["d_ei"]
+            self._d_IE = params["d_ie"]
+            self._d_II = params["d_ii"]
+
+            # Build matrices from parameters
+            self._build_connectivity_matrices()
+            self._is_trained = True
+            self._stage1_completed = True
+            self._stage2_completed = True
+
+        except FileNotFoundError:
+            # Fallback: load full matrix if parametric files not found
+            full_W = np.loadtxt(f"{input_path}/w_learn")
+            # TODO: Extract parameters from full matrix if needed
+            raise FileNotFoundError(
+                "Files with parameters were not found in the provided path"
+            )
+
+    def is_trained(self):
+        """Check if model has been trained with both stages completed."""
+        return (
+            self._is_trained
+            and self._stage1_completed
+            and self._stage2_completed
+        )
 
     # PROPERTY ================================================================
 
@@ -407,24 +739,53 @@ class Echeveste2020(SKNMSIMethodABC):
 
         return W_xy
 
-    def build_connectivity_matrix(self, connectivity_params):
+    def build_connectivity_matrix(self, connectivity_params=None):
         """
         Construct connectivity matrix using parametric formulation (Eq.10).
+
         Mathematical foundation:
         - Main paper, Eq. 10: W_XY(θi,θj) = a_XY * exp[(cos(2(θi-θj))-1)/d_XY²]
         - Only 8 parameters: {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}
         - Supplementary Material: Connectivity Parameter Optimization
-        Parameters:
-        -----------
-        connectivity_params : dict
-        Dictionary with the 8 connectivity parameters:
-        - 'a_EE', 'a_EI', 'a_IE', 'a_II': connectivity amplitudes
-        - 'd_EE', 'd_EI', 'd_IE', 'd_II': connectivity dispersions
-        Returns:
-        --------
+
+        Parameters
+        ----------
+        connectivity_params : dict, optional
+            Dictionary with the 8 connectivity parameters:
+            - 'a_EE', 'a_EI', 'a_IE', 'a_II': connectivity amplitudes
+            - 'd_EE', 'd_EI', 'd_IE', 'd_II': connectivity dispersions
+            If None, uses stored parameters from training.
+
+        Returns
+        -------
         W : np.ndarray, shape(N, N)
-        Complete connectivity matrix for use in SSNIntegrator
+            Complete connectivity matrix for use in SSNIntegrator
         """
+
+        # Use trained parameters if available, otherwise use provided params
+        if connectivity_params is None:
+            if not self.is_trained():
+                raise ValueError(
+                    "Model must be trained or connectivity_params must be provided"
+                )
+            # Use stored trained parameters
+            params = self._get_connectivity_parameters()
+        else:
+            params = connectivity_params
+
+        # If matrices already built, return assembled matrix
+        if (
+            self._W_EE is not None
+            and self._W_EI is not None
+            and self._W_IE is not None
+            and self._W_II is not None
+        ):
+            W_full = np.zeros((self._N, self._N))
+            W_full[: self._N_E, : self._N_E] = self._W_EE
+            W_full[: self._N_E, self._N_E :] = self._W_EI
+            W_full[self._N_E :, : self._N_E] = self._W_IE
+            W_full[self._N_E :, self._N_E :] = self._W_II
+            return W_full
 
         # Genera orientaciones preferidas para ring topology (Main paper Fig. 1B)
         # theta[i] = np.pi * i / N (en el caso de 180 grados)
@@ -453,29 +814,29 @@ class Echeveste2020(SKNMSIMethodABC):
         W[0 : self._N_E, 0 : self._N_E] = connectivity_block(
             theta_e,
             theta_e,
-            connectivity_params["a_EE"],
-            connectivity_params["d_EE"],
+            params["a_EE"],
+            params["d_EE"],
             sign=1,
         )
         W[0 : self._N_E, self._N_E : self._N] = connectivity_block(
             theta_e,
             theta_i,
-            connectivity_params["a_EI"],
-            connectivity_params["d_EI"],
+            params["a_EI"],
+            params["d_EI"],
             sign=-1,
         )
         W[self._N_E : self._N, 0 : self._N_E] = connectivity_block(
             theta_i,
             theta_e,
-            connectivity_params["a_IE"],
-            connectivity_params["d_IE"],
+            params["a_IE"],
+            params["d_IE"],
             sign=1,
         )
         W[self._N_E : self._N, self._N_E : self._N] = connectivity_block(
             theta_i,
             theta_i,
-            connectivity_params["a_II"],
-            connectivity_params["d_II"],
+            params["a_II"],
+            params["d_II"],
             sign=-1,
         )
 
@@ -528,15 +889,35 @@ class Echeveste2020(SKNMSIMethodABC):
         - Estimate cause positions from population activity peaks (orientation of filters)
         """
         # Extrae inferencia causal de dinámicas de sampling de la red SSN
-        
+
         return {"num_causes": None, "cause_positions": None}  # Placeholder
 
 
-# TODO: Funciones de utilidad a implementar siguiendo el marco matemático:
+# =============================================================================
+# USAGE EXAMPLE - Two-stage training following Echeveste et al. (2020)
+# =============================================================================
 #
-# - load_ssn_parameters(): Cargar parámetros de conectividad (a_XY, d_XY), inputs h, ruido Σ_η
-#   Base matemática: Supp. Material, optimización de 8 parámetros + covarianza ruido
-#   Archivos: parámetros (a_XY, d_XY para X,Y∈{E,I}), h (inputs GSM), Sigma_eta (ruido)
+# # Initialize untrained model
+# model = Echeveste2020(N_E=50, N_I=50, tau_e=20.0, tau_i=10.0)
+#
+# # Load pre-trained GSM generative model (trained on natural images)
+# # GSM contains Gabor filters, scale priors, and Gaussian field parameters
+# gsm_model = load_pretrained_gsm_model("./gsm_parameters/")
+#
+# # Execute two-stage training process (SSN learns inference on GSM)
+# training_results = model.train(
+#     gsm_model=gsm_model,
+#     stage1_params={"optimizer": "adam", "learning_rate": 0.01},  # Connectivity optimization
+#     stage2_params={"optimizer": "lbfgs", "tolerance": 1e-6}      # Other parameters
+# )
+#
+# # Save trained parameters (8 parametric + full matrices)
+# model.save_parameters("./trained_model/")
+#
+# # Run sampling-based inference simulation
+# result = model.run(stimulus_contrast=0.8, stimulus_orientation=45.0)
+#
+# TODO: Funciones de utilidad a implementar siguiendo el marco matemático:
 #
 # - create_gabor_stimulus(): Generar estímulos orientados del modelo generativo GSM
 #   Base matemática: Main paper Eq. 1-7, Supp. Section 1
