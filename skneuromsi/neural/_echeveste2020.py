@@ -72,6 +72,33 @@ class SSNIntegrator:
         """
         return self.k * np.power(np.maximum(0, u), self.n)
 
+    # TODELETE
+    def parametric_connectivity(self, theta_i, theta_j, a_xy, d_xy):
+        """
+        Calculate parametric connectivity using the formula in Equation 10.
+
+        Implement: W_XY(θi, θj) = a_XY * exp[(cos(2(θi - θj)) - 1) / d_XY²]
+        where:
+        - θi, θj: preferred orientations of neurons i, j (in radians)
+        - a_XY: connectivity amplitude between X→Y populations
+        - d_XY: connectivity width (dispersion parameter)
+
+        Mathematical foundation:
+        - Main paper, Eq. 10: Parametric connectivity with angular differences
+        - Only 8 parameters: {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}
+        - Circular topology: angular differences θi - θj determine connection strength
+
+        """
+
+        angular_diff = theta_i - theta_j  # Diferencia θi - θj
+
+        exp_term = np.exp((np.cos(2 * angular_diff) - 1) / (d_xy**2))
+
+        # Conectividad final: amplitud × perfil espacial
+        W_xy = a_xy * exp_term
+
+        return W_xy
+
     def __call__(self, u_e, u_i, t, W, h, eta):
         """
         Compute the SSN dynamics based on Echeveste et al. (2020) Equations 8-9.
@@ -96,47 +123,60 @@ class SSNIntegrator:
         - (du_e_dt, du_i_dt): Temporal derivatives from Equation 8
         """
 
-        # Computa las dinámicas del SSN según Ecuaciones 8-9 de Echeveste et al.
-        # Calcula firing rates usando activación supralineal (Eq. 9: r_α = k[u_α]_+^n)
-        r_e = self.supralinear_activation(
-            u_e
-        )  # Tasas excitatorias (Main paper Eq. 9)
-        r_i = self.supralinear_activation(
-            u_i
-        )  # Tasas inhibitorias (Main paper Eq. 9)
+        # Calcula firing rates usando activación supralineal (Eq. 9)
+        r_e = self.supralinear_activation(u_e)  # Tasas excitatorias
+        r_i = self.supralinear_activation(u_i)  # Tasas inhibitorias
 
-        # Extrae bloques de matriz de conectividad (Main paper Sec. 2.2: estructura E-I)
-        # W organizada como: [W_EE W_EI; W_IE W_II] siguiendo principio de Dale
-        n_e = len(
-            u_e
-        )  # Número de neuronas excitatorias (Supp. Table S1: N_E=50)
-        W_EE = W[
-            :n_e, :n_e
-        ]  # Conexiones E→E (Main paper Sec. 2.2, ring topology)
-        W_EI = W[:n_e, n_e:]  # Conexiones I→E (Dale: W_EI > 0, inhibe)
-        W_IE = W[n_e:, :n_e]  # Conexiones E→I (Dale: W_IE > 0, excita)
-        W_II = W[n_e:, n_e:]  # Conexiones I→I (Dale: W_II > 0, inhibe)
+        # Número de neuronas excitatorias (Supp. Table S1: N_E=50)
+        n_e = len(u_e)
+
+        # IMPORTANTE: En entrenamiento los pesos W no son matrices almacenadas
+        # sino que se calculan dinámicamente usando conectividad paramétrica (Eq. 10)
+        W_EE = W[:n_e, :n_e]  # Conexiones E←E
+        W_EI = W[:n_e, n_e:]  # Conexiones E←I
+        W_IE = W[n_e:, :n_e]  # Conexiones I←E
+        W_II = W[n_e:, n_e:]  # Conexiones I←I
 
         # Implementa dinámicas SSN (Ecuación 8): τ_α * du_α/dt = -u_α + Σ_β W_αβ r_β + h_α + η_α
         # Para neuronas excitatorias (α ∈ E):
         du_e_dt = (
-            -u_e  # Término de leak: -u_α (Main paper Eq. 8)
-            + W_EE
-            @ r_e  # Input excitatorio: Σ_β∈E W_αβ r_β (Main paper Eq. 8)
-            - W_EI @ r_i  # Input inhibitorio: -Σ_β∈I W_αβ r_β (Dale: W_EI > 0)
-            + h[:n_e]  # Input externo del modelo GSM: h_α (Eq. 6-7)
-            + eta[:n_e]  # Ruido de inferencia: η_α (Supp. Sec. 2.3)
-        ) / self.tau_e  # Divide por constante de tiempo τ_E = 20ms (Supp. Table S1)
+            -u_e  # Potencial de membrana
+            + h[:n_e]  # Input externo del modelo GSM
+            + W_EE @ r_e  # Input excitatorio: Σ_β∈E W_αβ r_β
+            - W_EI @ r_i  # Input inhibitorio: -Σ_β∈I W_αβ r_β
+            + eta[:n_e]  # Ruido de inferencia: η_α
+        ) / self.tau_e  # Divide por constante de tiempo τ_E
 
         # Para neuronas inhibitorias (α ∈ I):
         du_i_dt = (
-            -u_i  # Término de leak: -u_α (Main paper Eq. 8)
-            + W_IE
-            @ r_e  # Input excitatorio: Σ_β∈E W_αβ r_β (Main paper Eq. 8)
-            - W_II @ r_i  # Input inhibitorio: -Σ_β∈I W_αβ r_β (Dale: W_II > 0)
-            + h[n_e:]  # Input externo del modelo GSM: h_α (Eq. 6-7)
-            + eta[n_e:]  # Ruido de inferencia: η_α (Supp. Sec. 2.3)
-        ) / self.tau_i  # Divide por constante de tiempo τ_I = 10ms (Supp. Table S1)
+            -u_i + h[n_e:] + W_IE @ r_e - W_II @ r_i + eta[n_e:]
+        ) / self.tau_i
+
+        # IMPLEMENTACIÓN ALTERNATIVA usando conectividad paramétrica (Eq. 10):
+        # sera usada en un futuro en la etapa de entrenamiento
+        # # Orientaciones preferidas de neuronas (topología circular)
+        # # theta_e[i] = np.pi * i / len(u_e)
+        # theta_e = np.linspace(0, np.pi, len(u_e))  # Orientaciones excitatorias
+        # theta_i = np.linspace(0, np.pi, len(u_i))  # Orientaciones inhibitorias
+        #
+        # du_e_dt_parametric = np.zeros_like(u_e)
+        # for i in range(len(u_e)):  # Para cada neurona excitatoria i
+        #     # Input excitatorio: Σ_j W_EE(θi,θj) * r_e[j]
+        #     excitatory_input = np.sum([
+        #         self.parametric_connectivity(theta_e[i], theta_e[j], a_EE, d_EE) * r_e[j]
+        #         for j in range(len(u_e))
+        #     ])
+        #     # Input inhibitorio: -Σ_j W_EI(θi,θj) * r_i[j] (Dale: W_EI > 0)
+        #     inhibitory_input = -np.sum([
+        #         self.parametric_connectivity(theta_e[i], theta_i[j], a_EI, d_EI) * r_i[j]
+        #         for j in range(len(u_i))
+        #     ])
+        #     # Dinámicas completas: τ_e * du_e[i]/dt = -u_e[i] + inputs + h[i] + η[i]
+        #     du_e_dt_parametric[i] = (
+        #         -u_e[i] + excitatory_input + inhibitory_input + h[i] + eta[i]
+        #     ) / self.tau_e
+        #
+        # # FALTA VERSIÓN ALTERNATIVA para du_i_dt usando Eq. 10
 
         return du_e_dt, du_i_dt  # Retorna derivadas temporales de Eq. 8
 
@@ -159,6 +199,8 @@ class Echeveste2020(SKNMSIMethodABC):
     Key features:
     - Ring topology with E-I populations (Main paper, Section 2.2)
     - Supralinear activation r = k[u]_+^n (Eq. 9, n=2.0)
+    - Parametric connectivity: W_XY(θi,θj) = a_XY * exp[(cos(2(θi-θj))-1)/d_XY²] (Eq. 10)
+    - Solo 8 parámetros optimizados: {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}
     - GSM generative model for natural image patches (Eq. 1-7)
     - Sampling-based Bayesian inference (Main paper, Section 2.1)
     - Cortical-like gamma oscillations (Main paper, Figure 3)
@@ -179,15 +221,16 @@ class Echeveste2020(SKNMSIMethodABC):
     ]
     _output_mode = "excitatory"  # Primary output mode
 
+    # (Supp. Table S1)
     def __init__(
         self,
         *,
-        N_E=50,  # Número de neuronas excitatorias (Supp. Table S1)
-        N_I=50,  # Número de neuronas inhibitorias (Supp. Table S1)
-        tau_e=20.0,  # ms - Constante de tiempo excitatorias (Supp. Table S1)
-        tau_i=10.0,  # ms - Constante de tiempo inhibitorias (Supp. Table S1)
-        n=2.0,  # Exponente supralineal de Eq. 9 (Supp. Table S1)
-        k=0.3,  # Factor de escala de Eq. 9 (Supp. Table S1)
+        N_E=50,  # Número de neuronas excitatorias 
+        N_I=50,  # Número de neuronas inhibitorias 
+        tau_e=20.0,  # ms - Constante de tiempo excitatorias 
+        tau_i=10.0,  # ms - Constante de tiempo inhibitorias
+        n=2.0,  # Exponente supralineal de Eq. 9 
+        k=0.3,  # Factor de escala de Eq. 9 
         seed=None,  # Semilla para generador aleatorio
         position_range=(
             0,
@@ -195,7 +238,7 @@ class Echeveste2020(SKNMSIMethodABC):
         ),  # Orientaciones ring topology (Main paper, Figure 1B)
         position_res=360 / 100,  # Resolución angular para simetría circular
         time_range=(0, 1000),  # Rango temporal de simulación (ms)
-        time_res=0.2,  # Paso temporal dt = 0.2ms (Supp. Table S1)
+        time_res=0.2,  # Paso temporal dt
         **integrator_kws,  # Keywords adicionales para integrador
     ):
         """
@@ -210,18 +253,17 @@ class Echeveste2020(SKNMSIMethodABC):
         All default values match the optimized parameters from the paper's
         sampling-based inference optimization procedure.
         """
-        # Inicializa el modelo SSN con parámetros optimizados de Echeveste et al.
 
-        # Estructura básica de la red (Main paper Sec. 2.2: arquitectura E-I)
-        self._N_E = N_E  # Número de neuronas excitatorias (Supp. Table S1: 50)
-        self._N_I = N_I  # Número de neuronas inhibitorias (Supp. Table S1: 50)
+        # Estructura básica de la red
+        self._N_E = N_E  # Número de neuronas excitatorias
+        self._N_I = N_I  # Número de neuronas inhibitorias
         self._N = N_E + N_I  # Total de neuronas en ring topology
 
-        # Parámetros espaciales y temporales (Main paper Fig. 1B: ring topology)
+        # Parámetros espaciales y temporales 
         self._position_range = position_range  # Rango orientaciones [0°, 180°]
         self._position_res = position_res  # Resolución angular (3.6°)
         self._time_range = time_range  # Duración simulación (1000ms)
-        self._time_res = time_res  # dt = 0.2ms (Supp. Table S1)
+        self._time_res = time_res  # dt = 0.2ms
 
         # Crea integrador numérico para dinámicas SSN (Supp. Sec. 2.1)
         # Método Euler con dt = 0.2ms asegura estabilidad para dinámicas inhibitorias rápidas
@@ -252,43 +294,36 @@ class Echeveste2020(SKNMSIMethodABC):
     @property
     def N_E(self):
         """Number of excitatory neurons."""
-        # Número de neuronas excitatorias (Supp. Table S1)
         return self._N_E
 
     @property
     def N_I(self):
         """Number of inhibitory neurons."""
-        # Número de neuronas inhibitorias (Supp. Table S1)
         return self._N_I
 
     @property
     def position_range(self):
         """Range of orientations."""
-        # Rango de orientaciones para ring topology (Main paper Fig. 1B)
         return self._position_range
 
     @property
     def position_res(self):
         """Angular resolution."""
-        # Resolución angular para simetría circular (Main paper Fig. 1B)
         return self._position_res
 
     @property
     def time_range(self):
         """Time range for simulation."""
-        # Rango temporal para simulación SSN
         return self._time_range
 
     @property
     def time_res(self):
         """Time resolution."""
-        # Resolución temporal dt (Supp. Table S1: 0.2ms)
         return self._time_res
 
     # Ejecución del modelo
     def set_random(self, rng):
         """Set random number generator."""
-        # Establece generador aleatorio para ruido de inferencia η (Supp. Sec. 2.3)
         self._random = rng
 
     def run(
@@ -306,8 +341,6 @@ class Echeveste2020(SKNMSIMethodABC):
         # Ejecuta simulación SSN según protocolo de Echeveste et al.
 
         # Genera estímulo GSM (Main paper Eq. 1-7: I = z * G)
-        # stimulus_contrast corresponde a variable de escala z (Eq. 2)
-        # stimulus_orientation determina estructura del campo Gaussiano G (Eq. 3)
         stimulus = self._generate_gsm_stimulus(
             stimulus_contrast, stimulus_orientation  # Parámetros de GSM model
         )
@@ -319,6 +352,7 @@ class Echeveste2020(SKNMSIMethodABC):
 
         # TODO: Implementar loop completo de simulación siguiendo dinámicas Eq. 8
         # Debe integrar: τ_α * du_α/dt = -u_α + Σ_β W_αβ r_β + h_α + η_α
+        # donde W_αβ se calcula dinámicamente de parámetros a_XY, d_XY (Eq. 10)
         # Usando integrador BrainPy con dt = 0.2ms (Supp. Table S1)
         # Hasta alcanzar régimen de sampling steady-state (Main paper, Fig. 3)
 
@@ -346,6 +380,106 @@ class Echeveste2020(SKNMSIMethodABC):
             response,
             extra,
         )  # Retorna actividad y parámetros del experimento
+
+    def parametric_connectivity(self, theta_i, theta_j, a_xy, d_xy):
+        """
+        Calculate parametric connectivity using the formula in Equation 10.
+
+        Implement: W_XY(θi, θj) = a_XY * exp[(cos(2(θi - θj)) - 1) / d_XY²]
+        where:
+        - θi, θj: preferred orientations of neurons i, j (in radians)
+        - a_XY: connectivity amplitude between X→Y populations
+        - d_XY: connectivity width (dispersion parameter)
+
+        Mathematical foundation:
+        - Main paper, Eq. 10: Parametric connectivity with angular differences
+        - Only 8 parameters: {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}
+        - Circular topology: angular differences θi - θj determine connection strength
+
+        """
+
+        angular_diff = theta_i - theta_j  # Diferencia θi - θj
+
+        exp_term = np.exp((np.cos(2 * angular_diff) - 1) / (d_xy**2))
+
+        # Conectividad final: amplitud × perfil espacial
+        W_xy = a_xy * exp_term
+
+        return W_xy
+
+    def build_connectivity_matrix(self, connectivity_params):
+        """
+        Construct connectivity matrix using parametric formulation (Eq.10).
+        Mathematical foundation:
+        - Main paper, Eq. 10: W_XY(θi,θj) = a_XY * exp[(cos(2(θi-θj))-1)/d_XY²]
+        - Only 8 parameters: {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}
+        - Supplementary Material: Connectivity Parameter Optimization
+        Parameters:
+        -----------
+        connectivity_params : dict
+        Dictionary with the 8 connectivity parameters:
+        - 'a_EE', 'a_EI', 'a_IE', 'a_II': connectivity amplitudes
+        - 'd_EE', 'd_EI', 'd_IE', 'd_II': connectivity dispersions
+        Returns:
+        --------
+        W : np.ndarray, shape(N, N)
+        Complete connectivity matrix for use in SSNIntegrator
+        """
+
+        # Genera orientaciones preferidas para ring topology (Main paper Fig. 1B)
+        # theta[i] = np.pi * i / N (en el caso de 180 grados)
+        theta_e = np.linspace(
+            np.radians(self._position_range[0]),
+            np.radians(self._position_range[1]),
+            self._N_E,
+        )
+
+        theta_i = np.linspace(
+            np.radians(self._position_range[0]),
+            np.radians(self._position_range[1]),
+            self._N_I,
+        )
+
+        # Inicializar matriz W completa (N x N)
+        W = np.zeros((self._N, self._N))
+
+        # Construir bloques de conectividad usando parametric_connectivity
+        def connectivity_block(theta_pre, theta_post, a, d, sign=1):
+            delta_theta = theta_pre[:, None] - theta_post[None, :]
+            # return sign * a * np.exp((np.cos(2 * delta_theta) - 1) / d**2) TODELETE
+            return sign * self.parametric_connectivity(delta_theta, 0, a, d)
+
+        # Bloques matriciales
+        W[0 : self._N_E, 0 : self._N_E] = connectivity_block(
+            theta_e,
+            theta_e,
+            connectivity_params["a_EE"],
+            connectivity_params["d_EE"],
+            sign=1,
+        )
+        W[0 : self._N_E, self._N_E : self._N] = connectivity_block(
+            theta_e,
+            theta_i,
+            connectivity_params["a_EI"],
+            connectivity_params["d_EI"],
+            sign=-1,
+        )
+        W[self._N_E : self._N, 0 : self._N_E] = connectivity_block(
+            theta_i,
+            theta_e,
+            connectivity_params["a_IE"],
+            connectivity_params["d_IE"],
+            sign=1,
+        )
+        W[self._N_E : self._N, self._N_E : self._N] = connectivity_block(
+            theta_i,
+            theta_i,
+            connectivity_params["a_II"],
+            connectivity_params["d_II"],
+            sign=-1,
+        )
+
+        return W
 
     def _generate_gsm_stimulus(self, contrast, orientation):
         """
@@ -388,25 +522,21 @@ class Echeveste2020(SKNMSIMethodABC):
         - Supplementary Material, Section 3: Inference analysis methods
 
         TODO: Implement posterior analysis:
-        - Extract samples from network steady-state activity
+        - Extract samples from network steady-state activity (by sampling-based inference)
         - Compute posterior statistics (mean, variance, modes)
-        - Detect number of causes from multimodal posterior
-        - Estimate cause positions from population activity peaks
+        - Detect number of causes from multimodal posterior (number of filters)
+        - Estimate cause positions from population activity peaks (orientation of filters)
         """
         # Extrae inferencia causal de dinámicas de sampling de la red SSN
-        # TODO: Implementar análisis de posterior siguiendo Sec. 2.1 y Fig. 4-5
-        # - Extraer muestras de actividad steady-state (Main paper Eq. 10)
-        # - Computar estadísticas posterior: P(z,G|I) (Main paper Fig. 4)
-        # - Detectar número de causas de posterior multimodal (Fig. 5)
-        # - Estimar posiciones desde picos de actividad poblacional
+        
         return {"num_causes": None, "cause_positions": None}  # Placeholder
 
 
 # TODO: Funciones de utilidad a implementar siguiendo el marco matemático:
 #
-# - load_ssn_parameters(): Cargar conectividad W, inputs h, ruido Σ_η optimizados
-#   Base matemática: Supp. Material, procedimiento de optimización de parámetros
-#   Archivos: W (conectividad), h (inputs GSM), Sigma_eta (covarianza ruido inferencia)
+# - load_ssn_parameters(): Cargar parámetros de conectividad (a_XY, d_XY), inputs h, ruido Σ_η
+#   Base matemática: Supp. Material, optimización de 8 parámetros + covarianza ruido
+#   Archivos: parámetros (a_XY, d_XY para X,Y∈{E,I}), h (inputs GSM), Sigma_eta (ruido)
 #
 # - create_gabor_stimulus(): Generar estímulos orientados del modelo generativo GSM
 #   Base matemática: Main paper Eq. 1-7, Supp. Section 1
