@@ -19,6 +19,7 @@ generative model as described in Echeveste et al. (2020).
 
 import copy
 from dataclasses import dataclass
+import os
 
 import brainpy as bp
 
@@ -275,6 +276,11 @@ class Echeveste2020(SKNMSIMethodABC):
         self._W_IE = None  # Matriz de conectividad I-E
         self._W_II = None  # Matriz de conectividad I-I
 
+        # Storage for noise covariance matrix
+        self._Sigma_eta = (
+            None  # Matriz de covarianza del ruido η (optimizada en Stage 2)
+        )
+
         # Training state tracking
         self._is_trained = False
         self._stage1_completed = False
@@ -298,8 +304,8 @@ class Echeveste2020(SKNMSIMethodABC):
 
         # Inicializa integrador SSN con parámetros optimizados (Supp. Table S1)
         integrator_model = SSNIntegrator(
-            tau_e=tau_e / 1000.0, 
-            tau_i=tau_i / 1000.0, 
+            tau_e=tau_e / 1000.0,
+            tau_i=tau_i / 1000.0,
             n=n,  # Exponente supralineal n = 2.0 (Eq. 9)
             k=k,  # Factor de escala k = 0.3 (Eq. 9)
         )
@@ -339,6 +345,12 @@ class Echeveste2020(SKNMSIMethodABC):
         dict
             Training results with optimized parameters and convergence metrics
         """
+
+        print(
+            "method not yet implemented, following patterns of the code published by echeveste, use load_parameters() instead"
+        )
+        return None
+
         # Validate GSM model structure
         if not self._validate_gsm_model(gsm_model):
             raise ValueError("Invalid pre-trained GSM model")
@@ -567,13 +579,27 @@ class Echeveste2020(SKNMSIMethodABC):
         full_W = self.build_connectivity_matrix()
         np.savetxt(f"{output_path}/w_learn", full_W)
 
+        # Save noise covariance matrix
+        if self._Sigma_eta is not None:
+            np.savetxt(f"{output_path}/sigma_eta_learn", self._Sigma_eta)
+
     def load_parameters(self, input_path):
         """
         Load pre-trained parameters from files.
 
         Can load either from parametric files or full matrix,
         following Echeveste's dual storage approach.
+
+        Sets training stages based on what parameters are successfully loaded:
+        - Stage 1: Connectivity parameters (8 parametric values)
+        - Stage 2: Noise covariance matrix (Sigma_eta)
         """
+        # Reset training state
+        self._stage1_completed = False
+        self._stage2_completed = False
+        self._is_trained = False
+
+        # STAGE 1: Load connectivity parameters
         try:
             # Try loading parametric parameters first
             params = {}
@@ -587,7 +613,9 @@ class Echeveste2020(SKNMSIMethodABC):
                 "d_ie",
                 "d_ii",
             ]:
-                params[param] = np.loadtxt(f"{input_path}/w_{param}_learn")
+                params[param] = np.loadtxt(
+                    os.path.join(input_path, f"w_{param}_learn")
+                )
 
             # Set parametric values
             self._a_EE = params["a_ee"]
@@ -601,17 +629,47 @@ class Echeveste2020(SKNMSIMethodABC):
 
             # Build matrices from parameters
             self._build_connectivity_matrices()
-            self._is_trained = True
             self._stage1_completed = True
-            self._stage2_completed = True
+            print("Stage 1 parameters loaded successfully (connectivity)")
 
-        except FileNotFoundError:
-            # Fallback: load full matrix if parametric files not found
-            full_W = np.loadtxt(f"{input_path}/w_learn")
-            # TODO: Extract parameters from full matrix if needed
-            raise FileNotFoundError(
-                "Files with parameters were not found in the provided path"
+        except FileNotFoundError as e:
+            print(f"Warning: Could not load Stage 1 parameters: {e}")
+            # Try fallback: load full matrix if parametric files not found
+            try:
+                full_W = np.loadtxt(os.path.join(input_path, "w_learn"))
+                print("Loaded full connectivity matrix as fallback")
+                # TODO: Extract parameters from full matrix if needed
+            except FileNotFoundError:
+                print(
+                    "Error: No connectivity parameters found (neither parametric nor full matrix)"
+                )
+
+        # STAGE 2: Load noise parameters
+        try:
+            self._Sigma_eta = np.loadtxt(
+                os.path.join(input_path, "sigma_eta_learn")
             )
+            self._stage2_completed = True
+            print("Stage 2 parameters loaded successfully (noise covariance)")
+        except FileNotFoundError:
+            print(
+                "Warning: sigma_eta_learn not found, will use default noise in simulations"
+            )
+            self._Sigma_eta = None
+
+        # UPDATE TRAINING STATUS
+        # Model is considered fully trained if both stages completed
+        if self._stage1_completed and self._stage2_completed:
+            self._is_trained = True
+            print("Model fully trained - both stages completed")
+        elif self._stage1_completed:
+            print(
+                "Model partially trained - only Stage 1 (connectivity) completed"
+            )
+        elif self._stage2_completed:
+            print("Model partially trained - only Stage 2 (noise) completed")
+        else:
+            print("Model not trained - no parameters loaded successfully")
 
     def is_trained(self):
         """Check if model has been trained with both stages completed."""
@@ -670,32 +728,80 @@ class Echeveste2020(SKNMSIMethodABC):
         """
         Run the SSN simulation.
         """
-        # Ejecuta simulación SSN según protocolo de Echeveste et al.
+        # Verificar que el modelo esté entrenado antes de la simulación
+        if not self.is_trained():
+            raise ValueError(
+                "Model must be trained before simulation. Use train() or load_parameters() method first."
+            )
 
-        # Genera estímulo GSM (Main paper Eq. 1-7: I = z * G)
+        # Generacion del estimulo
+        # Main paper Eq. 1-7: I = z * G donde z es contraste, G es campo orientado
         stimulus = self._generate_gsm_stimulus(
             stimulus_contrast, stimulus_orientation  # Parámetros de GSM model
         )
 
-        # Establece condiciones iniciales para potenciales de membrana (Eq. 8)
-        # Empieza desde estado de reposo: u_α(t=0) = 0 para todas las neuronas α
-        u_e_0 = np.zeros(self._N_E)  # Potenciales excitatorios iniciales
-        u_i_0 = np.zeros(self._N_I)  # Potenciales inhibitorios iniciales
+        # Construir matriz de conectividad
+        # Main paper Eq. 10: W_XY(θi,θj) = a_XY * exp[(cos(2(θi-θj))-1)/d_XY²]
+        # Usa parámetros entrenados (8 parámetros) para construir matriz completa
+        W = self.build_connectivity_matrix()
 
-        # TODO: Implementar loop completo de simulación siguiendo dinámicas Eq. 8
-        # Debe integrar: τ_α * du_α/dt = -u_α + Σ_β W_αβ r_β + h_α + η_α
-        # donde W_αβ se calcula dinámicamente de parámetros a_XY, d_XY (Eq. 10)
-        # Usando integrador BrainPy con dt = 0.2ms (Supp. Table S1)
-        # Hasta alcanzar régimen de sampling steady-state (Main paper, Fig. 3)
+        # Main paper Eq. 8: Variables de estado u_α(t=0)
+        # Empieza desde estado de reposo para todas las neuronas
+        u_0 = np.concatenate(
+            [
+                np.zeros(self._N_E),  # Potenciales excitatorios iniciales
+                np.zeros(self._N_I),  # Potenciales inhibitorios iniciales
+            ]
+        )
 
-        # Respuesta placeholder - debe contener trayectoria SSN real
-        # Forma: (time_steps, neurons) donde time_steps = simulation_time/dt
-        excitatory_activity = np.zeros(
-            (100, self._N_E)
-        )  # Actividad población excitatorias r_E(t)
-        inhibitory_activity = np.zeros(
-            (100, self._N_I)
-        )  # Actividad población inhibitorias r_I(t)
+        # Parametro de ruido
+        # Supp. Material: Ruido η correlacionado temporal y espacialmente
+        # Usa matriz de covarianza entrenada si está disponible, sino usa default escalado
+        if self._Sigma_eta is not None:
+            # Usa matriz de covarianza entrenada (optimizada en Stage 2)
+            Sigma_eta = self._Sigma_eta * noise_level
+        else:
+            # Fallback: matriz identidad escalada (ruido no correlacionado)
+            Sigma_eta = noise_level * np.eye(self._N)
+
+        # Condición inicial para ruido correlacionado η(t=0)
+        eta_0 = self._random.multivariate_normal(np.zeros(self._N), Sigma_eta)
+
+        # =====================================
+        # 5. SIMULACIÓN CON BRAINPY
+        # =====================================
+        # Usar integrador configurado que implementa dinámicas Eq. 8
+        # τ_α * du_α/dt = -u_α + Σ_β W_αβ r_β + h_α + η_α
+
+        # Tiempo de simulación para alcanzar steady-state (Main paper Fig. 3)
+        simulation_steps = int(simulation_time / self._time_res)
+        time_array = np.linspace(
+            0, simulation_time / 1000.0, simulation_steps
+        )  # BrainPy usa segundos
+
+        # Ejecutar integración ODE usando BrainPy
+        # self._integrator implementa las dinámicas SSN con ruido
+        trajectory = self._integrator(
+            [u_0, eta_0],  # Condiciones iniciales [u(0), η(0)]
+            time_array,  # Vector de tiempo
+            W=W,  # Matriz de conectividad
+            h=stimulus,  # Input externo del GSM
+            Sigma_eta=Sigma_eta,  # Covarianza del ruido
+        )
+
+        # =====================================
+        # 6. EXTRACCIÓN DE ACTIVIDAD NEURONAL
+        # =====================================
+        # trajectory contiene [u(t), η(t)] para todos los tiempos
+        u_trajectory = trajectory[0]  # Potenciales de membrana u_α(t)
+
+        # Calcular actividad r_α(t) = k * [u_α(t)]_+^n (Main paper Eq. 9)
+        excitatory_activity = self.supralinear_activation(
+            u_trajectory[:, : self._N_E]  # Solo neuronas excitatorias
+        )
+        inhibitory_activity = self.supralinear_activation(
+            u_trajectory[:, self._N_E :]  # Solo neuronas inhibitorias
+        )
 
         response = {
             "excitatory": excitatory_activity,  # Actividad excitatorias (Main paper Fig. 4)
