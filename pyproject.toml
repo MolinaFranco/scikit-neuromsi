@@ -7,6 +7,10 @@ markers = [
     "slow: marks tests that require significant execution time (deselect with '-m \"not slow\"')",
     "plot: marks tests related to matplotlib integration (deselect with '-m \"not plot\"')",
     "model: marks tests involving MSI model calculations (deselect with '-m \"not model\"')",
+    "comparison: marks tests that compare with original Echeveste implementation",
+    "integration: marks tests for complete pipeline integration",
+    "benchmark: marks performance and memory benchmark tests",
+    "validation: marks scientific validation tests",
 ]
 testpaths = [
     "tests",
@@ -73,6 +77,8 @@ dependencies = [
     "pympler",
     "psutil",
     "lz4",
+    "matplotlib",  # For visualization in tests
+    "pandas",      # For data analysis in tests
 ]
 
 [project.urls]

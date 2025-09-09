@@ -381,3 +381,37 @@ def compute_latency(time, latency):
     if time - latency >= 0:
         return time - latency
     return 0
+
+
+# =============================================================================
+# RANDOM STATE TOOLS
+# =============================================================================
+
+
+def set_neural_random(random_seed=None):
+    """
+    Set up random state for neural models.
+
+    Creates a numpy RandomState instance with the given seed for
+    reproducible random number generation in neural simulations.
+
+    Parameters
+    ----------
+    random_seed : int, optional
+        Random seed for reproducibility. If None, uses system time.
+
+    Returns
+    -------
+    numpy.random.RandomState
+        Random state instance for neural model use.
+
+    Notes
+    -----
+    This function provides a consistent interface for setting up
+    random number generation in neural models, ensuring reproducibility
+    when a seed is provided.
+    """
+    if random_seed is not None:
+        return np.random.RandomState(random_seed)
+    else:
+        return np.random.RandomState()
