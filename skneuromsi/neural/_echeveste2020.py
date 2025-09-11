@@ -1005,12 +1005,17 @@ class Echeveste2020(SKNMSIMethodABC):
         else:
             params = connectivity_params
 
-        # If matrices already built, return assembled matrix
+        # If matrices already built and size matches exactly, return assembled
+        # matrix
         if (
             self._W_EE is not None
             and self._W_EI is not None
             and self._W_IE is not None
             and self._W_II is not None
+            and self._W_EE.shape == (self._N_E, self._N_E)
+            and self._W_EI.shape == (self._N_E, self._N_I)
+            and self._W_IE.shape == (self._N_I, self._N_E)
+            and self._W_II.shape == (self._N_I, self._N_I)
         ):
             W_full = np.zeros((self._N, self._N))
             W_full[: self._N_E, : self._N_E] = self._W_EE
@@ -1040,11 +1045,9 @@ class Echeveste2020(SKNMSIMethodABC):
         # Construir bloques de conectividad usando parametric_connectivity
         def connectivity_block(theta_pre, theta_post, a, d, sign=1):
             delta_theta = theta_pre[:, None] - theta_post[None, :]
-            # return sign * a * np.exp((np.cos(2 * delta_theta) - 1) / d**2)
-            # TODELETE
-            return sign * self.parametric_connectivity(delta_theta, 0, a, d)
+            return sign * a * np.exp((np.cos(2 * delta_theta) - 1) / d**2)
 
-        # Bloques matriciales
+        # Bloques matriciales (all positive, signs applied in dynamics)
         W[0: self._N_E, 0: self._N_E] = connectivity_block(
             theta_e,
             theta_e,
@@ -1057,7 +1060,7 @@ class Echeveste2020(SKNMSIMethodABC):
             theta_i,
             params["a_EI"],
             params["d_EI"],
-            sign=-1,
+            sign=1,
         )
         W[self._N_E: self._N, 0: self._N_E] = connectivity_block(
             theta_i,
@@ -1071,12 +1074,12 @@ class Echeveste2020(SKNMSIMethodABC):
             theta_i,
             params["a_II"],
             params["d_II"],
-            sign=-1,
+            sign=1,
         )
 
         return W
 
-    def _generate_gsm_stimulus(self, contrast, orientation):
+    def _generate_gsm_stimulus(self, contrast, orientation=0.0):
         """
         Generate stimulus from Gaussian Scale Mixture (GSM) generative model.
 
@@ -1201,5 +1204,6 @@ class Echeveste2020(SKNMSIMethodABC):
           (orientation of filters)
         """
         # Extrae inferencia causal de dinámicas de sampling de la red SSN
+        _ = kwargs  # Placeholder for future implementation
 
         return {"num_causes": None, "cause_positions": None}  # Placeholder
