@@ -24,6 +24,8 @@ contrast scaling, providing realistic visual stimuli for neural network models.
 
 import numpy as np
 
+from ..data import GSMDataLoader
+
 
 # =============================================================================
 # CONSTANTS
@@ -189,8 +191,17 @@ class GSM:
         correlation_strength=0.5,
         noise_variance=0.01,
         random_seed=None,
+        use_pretrained=True,
     ):
-        """Initialize the GSM model."""
+        """Initialize the GSM model.
+
+        Parameters
+        ----------
+        use_pretrained : bool, optional
+            If True, load pre-trained Gabor filters and covariance matrix
+            from GSMDataLoader. If False, generate new ones.
+            Default: True.
+        """
         # Model parameters
         self.patch_size = patch_size
         self.n_orientations = n_orientations
@@ -200,6 +211,7 @@ class GSM:
         self.bandwidth = bandwidth
         self.correlation_strength = correlation_strength
         self.noise_variance = noise_variance
+        self.use_pretrained = use_pretrained
 
         # Nonlinearity parameters for SSN input h
         self.alpha_h = alpha_h  # Input scaling
@@ -211,16 +223,11 @@ class GSM:
             np.random.seed(random_seed)
         self._random_state = np.random.RandomState(random_seed)
 
-        # Generate Gabor filter bank
-        self.A = generate_gabor_filters(
-            patch_size, n_orientations, spatial_freq, bandwidth
-        )
-
-        # Generate prior covariance matrix
-        self.C = generate_covariance_matrix(
-            n_orientations, correlation_strength
-        )
-        self.C_inv = np.linalg.inv(self.C)
+        # Load or generate Gabor filters and covariance matrix
+        if use_pretrained:
+            self._load_pretrained_data()
+        else:
+            self._generate_new_data()
 
         # Precompute W_ff AQUI, en el constructor.
         A_concat = np.concatenate([self.A, self.A], axis=1)
@@ -230,8 +237,46 @@ class GSM:
         self.ATA = self.A.T @ self.A
 
         # Store dimensions
-        self.patch_dim = patch_size * patch_size
-        self.orientation_dim = n_orientations
+        self.patch_dim = self.patch_size * self.patch_size
+        self.orientation_dim = self.n_orientations
+
+    def _load_pretrained_data(self):
+        """Load pre-trained Gabor filters and covariance matrix."""
+        try:
+            loader = GSMDataLoader()
+            self.A = loader.load_gabor_filters()
+            self.C = loader.load_prior_covariance()
+            self.C_inv = np.linalg.inv(self.C)
+
+            # Update dimensions
+            self.patch_dim, self.orientation_dim = self.A.shape
+            self.patch_size = int(np.sqrt(self.patch_dim))
+            self.n_orientations = self.orientation_dim
+
+            print("Loaded pre-trained GSM data from GSMDataLoader")
+
+        except Exception as e:
+            print(f"Warning: Could not load pre-trained GSM data: {e}")
+            print("Falling back to generating new data")
+            self._generate_new_data()
+
+    def _generate_new_data(self):
+        """Generate new Gabor filters and covariance matrix."""
+        # Generate Gabor filter bank
+        self.A = generate_gabor_filters(
+            self.patch_size,
+            self.n_orientations,
+            self.spatial_freq,
+            self.bandwidth,
+        )
+
+        # Generate prior covariance matrix
+        self.C = generate_covariance_matrix(
+            self.n_orientations, self.correlation_strength
+        )
+        self.C_inv = np.linalg.inv(self.C)
+
+        print("Generated new GSM data")
 
     def set_random(self, random_seed):
         """Set random seed for reproducible stimulus generation."""

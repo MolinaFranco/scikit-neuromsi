@@ -26,6 +26,8 @@ from scipy.stats import pearsonr
 from skneuromsi.generative import create_echeveste_gsm
 from skneuromsi.neural import Echeveste2020
 
+from ..reference_data.reference_loader import EchevesteReferenceData
+
 # =============================================================================
 # ECHEVESTE 2020 TESTS
 # =============================================================================
@@ -535,3 +537,26 @@ class TestEchevesteRegression:
         # Overall statistics should be in reasonable range
         assert np.abs(np.mean(W)) < 1.0  # Not too large in magnitude
         assert np.std(W) > 0.001  # Has some variability
+
+    def test_with_reference_data(self):
+        """Test using reference data from original Echeveste implementation."""
+        ref_data = EchevesteReferenceData()
+
+        # Test that reference data loads correctly
+        assert ref_data.validate_data_integrity()
+
+        # Test parameter loading
+        params = ref_data.get_connectivity_parameters()
+        assert abs(params["a_EE"] - 0.331) < 0.001
+
+        # Test GSM validation
+        gsm = create_echeveste_gsm(random_seed=42)
+        gsm.A = ref_data.get_gabor_filters()
+
+        x_ref, h_ref = ref_data.get_reference_stimulus(1)  # contrast 0.125
+        h_ours = gsm.generate_h_input(x_ref)
+
+        # Should have perfect correlation
+        if not np.all(h_ref == 0):
+            corr, _ = pearsonr(h_ours, h_ref)
+            assert corr > 0.999, f"Reference correlation {corr:.6f} too low"

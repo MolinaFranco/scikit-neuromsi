@@ -2,6 +2,21 @@
 line-length = 79
 target-version = ['py310', 'py311', 'py312', 'py313']
 
+[tool.flake8]
+max-line-length = 79
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    ".pytest_cache",
+    ".tox"
+]
+ignore = [
+    "E203",  # whitespace before ':'
+    "W503",  # line break before binary operator
+]
+
 [tool.pytest.ini_options]
 markers = [
     "slow: marks tests that require significant execution time (deselect with '-m \"not slow\"')",

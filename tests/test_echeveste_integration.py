@@ -310,9 +310,7 @@ class TestEchevesteOriginalComparison:
             range_ratio = our_range_mean / orig_range if orig_range != 0 else 1
 
             # Allow reasonable variation due to randomness
-            assert (
-                0.5 < mean_ratio < 2.0
-            ), (
+            assert 0.5 < mean_ratio < 2.0, (
                 f"Mean ratio {mean_ratio:.3f} too extreme for "
                 f"contrast {contrast}"
             )

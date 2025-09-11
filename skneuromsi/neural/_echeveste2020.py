@@ -16,6 +16,7 @@ import brainpy as bp
 import numpy as np
 
 from ..core import SKNMSIMethodABC
+from ..data import EchevesteDataLoader
 
 
 @dataclass
@@ -284,6 +285,10 @@ class Echeveste2020(SKNMSIMethodABC):
             "dt", time_res / 1000.0
         )  # Convierte ms a segundos para BrainPy
 
+        # Remove seed from integrator_kws if present
+        integrator_kws.pop("seed", None)
+        integrator_kws.pop("random_seed", None)
+
         # Inicializa integrador SSN con parámetros optimizados (Supp. Table S1)
         integrator_model = SSNIntegrator(
             tau_e=tau_e / 1000.0,
@@ -486,7 +491,7 @@ class Echeveste2020(SKNMSIMethodABC):
             self._d_EE,
         )
         self._W_EI = self._build_parametric_matrix(
-            orientations[:self._N_E],
+            orientations[: self._N_E],
             orientations[self._N_E:],
             self._a_EI,
             self._d_EI,
@@ -583,12 +588,14 @@ class Echeveste2020(SKNMSIMethodABC):
         if self._Sigma_eta is not None:
             np.savetxt(f"{output_path}/sigma_eta_learn", self._Sigma_eta)
 
-    def load_parameters(self, input_path):
+    def load_parameters(self, input_path=None):
         """
-        Load pre-trained parameters from files.
+        Load pre-trained parameters from files or internal data loader.
 
-        Can load either from parametric files or full matrix,
-        following Echeveste's dual storage approach.
+        Can load from:
+        1. Internal EchevesteDataLoader (if input_path is None)
+        2. External directory path (for custom parameters)
+        3. Full matrix fallback
 
         Sets training stages based on what parameters are successfully loaded:
         - Stage 1: Connectivity parameters (8 parametric values)
@@ -601,62 +608,95 @@ class Echeveste2020(SKNMSIMethodABC):
 
         # STAGE 1: Load connectivity parameters
         try:
-            # Try loading parametric parameters first
-            params = {}
-            for param in [
-                "a_ee",
-                "a_ei",
-                "a_ie",
-                "a_ii",
-                "d_ee",
-                "d_ei",
-                "d_ie",
-                "d_ii",
-            ]:
-                params[param] = np.loadtxt(
-                    os.path.join(input_path, f"w_{param}_learn")
-                )
+            if input_path is None:
+                # Use internal data loader
+                loader = EchevesteDataLoader()
+                params = loader.load_ssn_connectivity_parameters()
+                # Set parametric values from internal loader
+                self._a_EE = params["a_EE"]
+                self._a_EI = params["a_EI"]
+                self._a_IE = params["a_IE"]
+                self._a_II = params["a_II"]
+                self._d_EE = params["d_EE"]
+                self._d_EI = params["d_EI"]
+                self._d_IE = params["d_IE"]
+                self._d_II = params["d_II"]
+                print("Stage 1 parameters loaded from internal data loader")
+            else:
+                # Load from external directory (original behavior)
+                param_mapping = {
+                    "a_ee": "w_ee_height_learn",
+                    "a_ei": "w_ei_height_learn",
+                    "a_ie": "w_ie_height_learn",
+                    "a_ii": "w_ii_height_learn",
+                    "d_ee": "w_ee_width_learn",
+                    "d_ei": "w_ei_width_learn",
+                    "d_ie": "w_ie_width_learn",
+                    "d_ii": "w_ii_width_learn"
+                }
 
-            # Set parametric values
-            self._a_EE = params["a_ee"]
-            self._a_EI = params["a_ei"]
-            self._a_IE = params["a_ie"]
-            self._a_II = params["a_ii"]
-            self._d_EE = params["d_ee"]
-            self._d_EI = params["d_ei"]
-            self._d_IE = params["d_ie"]
-            self._d_II = params["d_ii"]
+                params = {}
+                for param_key, file_name in param_mapping.items():
+                    params[param_key] = np.loadtxt(
+                        os.path.join(input_path, file_name)
+                    )
 
+                # Set parametric values
+                self._a_EE = params["a_ee"]
+                self._a_EI = params["a_ei"]
+                self._a_IE = params["a_ie"]
+                self._a_II = params["a_ii"]
+                self._d_EE = params["d_ee"]
+                self._d_EI = params["d_ei"]
+                self._d_IE = params["d_ie"]
+                self._d_II = params["d_ii"]
+                print("Stage 1 parameters loaded successfully (connectivity)")
+
+            # Mark stage 1 as completed first, then build matrices
+            self._stage1_completed = True
             # Build matrices from parameters
             self._build_connectivity_matrices()
-            self._stage1_completed = True
-            print("Stage 1 parameters loaded successfully (connectivity)")
 
         except FileNotFoundError as e:
-            print(f"Warning: Could not load Stage 1 parameters: {e}")
-            # Try fallback: load full matrix if parametric files not found
-            try:
-                _ = np.loadtxt(
-                    os.path.join(input_path, "w_learn")
-                )  # noqa: F841
-                print("Loaded full connectivity matrix as fallback")
-                # TODO: Extract parameters from full matrix if needed
-            except FileNotFoundError:
-                print(
-                    """Error: No connectivity parameters found (neither
-                    parametric nor full matrix)"""
-                )
+            if input_path is not None:
+                print(f"Warning: Could not load Stage 1 parameters: {e}")
+                # Try fallback: load full matrix if parametric files not found
+                try:
+                    w_full = np.loadtxt(os.path.join(input_path, "w_learn"))
+                    print("Loaded full connectivity matrix as fallback")
+                    print(f"Full W matrix shape: {w_full.shape}")
+                    # Store the full matrix for use in simulations
+                    self._W_full = w_full
+                    # Mark as partially trained
+                    self._stage1_completed = True
+                except FileNotFoundError:
+                    print(
+                        """Error: No connectivity parameters found (neither
+                        parametric nor full matrix)"""
+                    )
+            else:
+                print(f"Error loading from internal data loader: {e}")
 
         # STAGE 2: Load noise parameters
         try:
-            self._Sigma_eta = np.loadtxt(
-                os.path.join(input_path, "sigma_eta_learn")
-            )
+            if input_path is None:
+                # Use internal data loader
+                loader = EchevesteDataLoader()
+                self._Sigma_eta = loader.load_noise_covariance()
+                print("Stage 2 parameters loaded from internal data loader")
+            else:
+                # Load from external directory
+                self._Sigma_eta = np.loadtxt(
+                    os.path.join(input_path, "sigma_eta_learn")
+                )
+                print("Stage 2 parameters loaded successfully "
+                      "(noise covariance)")
+
             self._stage2_completed = True
-            print("Stage 2 parameters loaded successfully (noise covariance)")
+
         except FileNotFoundError:
             print(
-                """Warning: sigma_eta_learn not found,
+                """Warning: noise covariance not found,
                 will use default noise in simulations"""
             )
             self._Sigma_eta = None
@@ -681,13 +721,9 @@ class Echeveste2020(SKNMSIMethodABC):
 
     def is_trained(self):
         """Check if model has been trained with both stages completed."""
-        return (
-            self._is_trained
-            and self._stage1_completed
-            and self._stage2_completed
-        )
+        return (self._stage1_completed and self._stage2_completed)
 
-    # PROPERTY ================================================================
+    # PROPERTY ============================================================
 
     @property
     def N_E(self):
@@ -831,10 +867,10 @@ class Echeveste2020(SKNMSIMethodABC):
             # Calcula actividad neuronal usando
             # función supralineal (Main paper, Eq. 9)
             # r_α = k * [u_α]_+^n donde k=0.3, n=2.0, [x]_+ = max(0,x)
-            r_e = self.supralinear_activation(
+            r_e = self._integrator.f.supralinear_activation(
                 u_old[: self._N_E]
             )  # Excitatorias
-            r_i = self.supralinear_activation(
+            r_i = self._integrator.f.supralinear_activation(
                 u_old[self._N_E:]
             )  # Inhibitorias
             _ = np.concatenate([r_e, r_i])  # noqa: F841
@@ -878,10 +914,10 @@ class Echeveste2020(SKNMSIMethodABC):
         u_trajectory = trajectory[0]  # Potenciales de membrana u_α(t)
 
         # Calcular actividad r_α(t) = k * [u_α(t)]_+^n (Main paper Eq. 9)
-        excitatory_activity = self.supralinear_activation(
+        excitatory_activity = self._integrator.f.supralinear_activation(
             u_trajectory[:, : self._N_E]  # Solo neuronas excitatorias
         )
-        inhibitory_activity = self.supralinear_activation(
+        inhibitory_activity = self._integrator.f.supralinear_activation(
             u_trajectory[:, self._N_E:]  # Solo neuronas inhibitorias
         )
 
@@ -955,11 +991,15 @@ class Echeveste2020(SKNMSIMethodABC):
         """
         # Use trained parameters if available, otherwise use provided params
         if connectivity_params is None:
-            if not self.is_trained():
+            if not self._stage1_completed:
                 raise ValueError(
-                    """Model must be trained or
+                    """Stage 1 must be completed or
                     connectivity_params must be provided"""
                 )
+
+            # Check if we have the full matrix loaded as fallback
+            if hasattr(self, '_W_full') and self._W_full is not None:
+                return self._W_full
             # Use stored trained parameters
             params = self._get_connectivity_parameters()
         else:
@@ -1066,8 +1106,16 @@ class Echeveste2020(SKNMSIMethodABC):
             contrast_level, n_samples=1
         )
 
-        # Return single stimulus vector
-        return h_samples[0]
+        # The GSM returns h for orientations (50 dimensions)
+        # SSN needs input for both E and I populations (100 dimensions)
+        # Following Echeveste: both E and I get the same external input
+        h_orientation = h_samples[0]  # Shape: (50,)
+
+        # Replicate for both E and I populations
+        # Shape: (100,)
+        h_full = np.concatenate([h_orientation, h_orientation])
+
+        return h_full
 
     def _create_gsm(self):
         """Create GSM instance for stimulus generation.
@@ -1078,11 +1126,10 @@ class Echeveste2020(SKNMSIMethodABC):
             GSM instance configured for this SSN model.
         """
         try:
-            from ..generative import Echeveste2020GSM
+            from ..generative import GSM
 
             # Create GSM with parameters matching this SSN
-            gsm = Echeveste2020GSM(
-                modality="visual",
+            gsm = GSM(
                 patch_size=16,
                 n_orientations=self._N,  # Match SSN neuron count
                 h_scale=1.0 / 15.0,  # Echeveste's scaling factor
@@ -1091,7 +1138,8 @@ class Echeveste2020(SKNMSIMethodABC):
                 bandwidth=1.0,
                 correlation_strength=0.5,
                 noise_variance=0.01,
-                random_seed=self._random_seed,
+                random_seed=getattr(self, '_random_seed', None),
+                use_pretrained=True,  # Use internal data loader
             )
 
             return gsm
