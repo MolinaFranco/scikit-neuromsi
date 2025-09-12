@@ -541,3 +541,177 @@ class TestEchevesteRegression:
         # Overall statistics should be in reasonable range
         assert np.abs(np.mean(W)) < 1.0  # Not too large in magnitude
         assert np.std(W) > 0.001  # Has some variability
+
+
+@pytest.mark.integration
+class TestEcheveste2020CausalInference:
+    """Tests for causal inference functionality in Echeveste2020."""
+
+    def test_calculate_causes_basic(self):
+        """Test basic functionality of calculate_causes method."""
+        ssn = Echeveste2020(N_E=25, N_I=25, seed=42)
+
+        # Create synthetic network activity
+        network_activity = np.random.rand(50) * 0.5
+
+        # Test basic call
+        results = ssn.calculate_causes(network_activity=network_activity)
+
+        # Check return structure
+        assert isinstance(results, dict)
+        assert 'num_causes' in results
+        assert 'cause_positions' in results
+        assert 'cause_contrasts' in results
+        assert 'confidence' in results
+        assert 'posterior_distribution' in results
+        assert 'posterior_stats' in results
+
+        # Check types
+        assert isinstance(results['num_causes'], int)
+        assert isinstance(results['cause_positions'], list)
+        assert isinstance(results['cause_contrasts'], list)
+        assert isinstance(results['confidence'], list)
+        assert isinstance(results['posterior_distribution'], dict)
+        assert isinstance(results['posterior_stats'], dict)
+
+        # Check lengths are consistent
+        assert len(results['cause_positions']) == results['num_causes']
+        assert len(results['cause_contrasts']) == results['num_causes']
+        assert len(results['confidence']) == results['num_causes']
+
+    def test_calculate_causes_with_stimulus(self):
+        """Test calculate_causes with stimulus input."""
+        ssn = Echeveste2020(N_E=25, N_I=25, seed=42)
+
+        # Create synthetic stimulus (matching GSM output dimensionality)
+        stimulus = np.random.rand(25) * 0.3
+
+        # Test with stimulus
+        results = ssn.calculate_causes(stimulus=stimulus)
+
+        # Should work without errors
+        assert results['num_causes'] >= 0
+        assert len(results['posterior_distribution']['contrast_values']) == 201
+
+    def test_calculate_causes_posterior_distribution(self):
+        """Test posterior distribution properties."""
+        ssn = Echeveste2020(N_E=25, N_I=25, seed=42)
+
+        # Create activity with clear pattern
+        network_activity = np.zeros(50)
+        network_activity[10] = 1.0  # Strong activity at one location
+        network_activity[35] = 0.3  # Weaker inhibitory activity
+
+        results = ssn.calculate_causes(network_activity=network_activity)
+
+        posterior = results['posterior_distribution']
+
+        # Check posterior distribution properties
+        assert len(posterior['contrast_values']) == 201
+        assert len(posterior['probabilities']) == 201
+        assert 0.0 <= posterior['map_estimate'] <= 5.0
+
+        # Probabilities should be normalized (sum to ~1)
+        prob_sum = np.sum(posterior['probabilities'])
+        assert 0.9 <= prob_sum <= 1.1
+
+        # All probabilities should be non-negative
+        assert np.all(posterior['probabilities'] >= 0)
+
+    def test_calculate_causes_peak_detection(self):
+        """Test peak detection with different thresholds."""
+        ssn = Echeveste2020(N_E=25, N_I=25, seed=42)
+
+        # Create activity that should produce multiple peaks
+        network_activity = np.random.rand(50) * 0.1
+        network_activity[:5] = 0.8  # Strong activity region 1
+        network_activity[15:20] = 0.6  # Medium activity region 2
+
+        # Test with low threshold (should find more peaks)
+        results_low = ssn.calculate_causes(
+            network_activity=network_activity,
+            peak_threshold=0.01
+        )
+
+        # Test with high threshold (should find fewer peaks)
+        results_high = ssn.calculate_causes(
+            network_activity=network_activity,
+            peak_threshold=0.5
+        )
+
+        # Low threshold should find more or equal peaks
+        assert results_low['num_causes'] >= results_high['num_causes']
+
+    def test_calculate_causes_confidence_filtering(self):
+        """Test confidence-based filtering of causes."""
+        ssn = Echeveste2020(N_E=25, N_I=25, seed=42)
+
+        network_activity = np.random.rand(50) * 0.3
+
+        # Test with different confidence thresholds
+        results_low_conf = ssn.calculate_causes(
+            network_activity=network_activity,
+            confidence_threshold=0.1
+        )
+
+        results_high_conf = ssn.calculate_causes(
+            network_activity=network_activity,
+            confidence_threshold=0.8
+        )
+
+        # High confidence threshold should result in fewer causes
+        assert results_high_conf['num_causes'] <= results_low_conf['num_causes']
+
+        # All returned confidences should exceed threshold
+        for conf in results_high_conf['confidence']:
+            assert conf >= 0.8
+
+    def test_calculate_causes_posterior_stats(self):
+        """Test posterior statistics calculation."""
+        ssn = Echeveste2020(N_E=25, N_I=25, seed=42)
+
+        network_activity = np.random.rand(50) * 0.5
+
+        results = ssn.calculate_causes(network_activity=network_activity)
+
+        stats = results['posterior_stats']
+
+        # Check required statistics
+        assert 'mean' in stats
+        assert 'std' in stats
+        assert 'modes' in stats
+
+        # Check value ranges
+        assert 0.0 <= stats['mean'] <= 5.0
+        assert stats['std'] >= 0.0
+        assert isinstance(stats['modes'], list)
+
+    def test_calculate_causes_error_handling(self):
+        """Test error handling in calculate_causes."""
+        ssn = Echeveste2020(N_E=25, N_I=25, seed=42)
+
+        # Test with no input
+        with pytest.raises(ValueError, match="Either network_activity or stimulus must be provided"):
+            ssn.calculate_causes()
+
+        # Test with wrong activity dimensions
+        with pytest.raises(ValueError, match="Network activity must have length"):
+            ssn.calculate_causes(network_activity=np.random.rand(10))
+
+    def test_calculate_causes_custom_contrast_range(self):
+        """Test calculate_causes with custom contrast range."""
+        ssn = Echeveste2020(N_E=25, N_I=25, seed=42)
+
+        network_activity = np.random.rand(50) * 0.3
+
+        # Test with custom contrast range
+        custom_range = np.linspace(0, 2, 101)
+        results = ssn.calculate_causes(
+            network_activity=network_activity,
+            contrast_range=custom_range
+        )
+
+        # Check that custom range is used
+        assert len(results['posterior_distribution']['contrast_values']) == 101
+        assert np.max(results['posterior_distribution']['contrast_values']) <= 2.0
+        assert results['posterior_distribution']['map_estimate'] <= 2.0
