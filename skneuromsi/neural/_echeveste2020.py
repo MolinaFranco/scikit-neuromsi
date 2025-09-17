@@ -225,7 +225,7 @@ class Echeveste2020(SKNMSIMethodABC):
             0,
             180,
         ),  # Orientaciones ring topology (Main paper, Figure 1B)
-        position_res=360 / 100,  # Resolución angular para simetría circular
+        position_res=None,  # Calculated based on N_E for exact matching
         time_range=(0, 1000),  # Rango temporal de simulación (ms)
         time_res=0.2,  # Paso temporal dt
         **integrator_kws,  # Keywords adicionales para integrador
@@ -278,7 +278,16 @@ class Echeveste2020(SKNMSIMethodABC):
 
         # Parámetros espaciales y temporales
         self._position_range = position_range  # Rango orientaciones [0°, 180°]
-        self._position_res = position_res  # Resolución angular (3.6°)
+        # Calculate position_res to match number of neurons for exact grid
+        if position_res is None:
+            # For ring topology: resolution = range / number_of_neurons
+            # This ensures grid positions exactly match neuron count
+            range_span = position_range[1] - position_range[0]
+            self._position_res = (
+                range_span / self._N_E if self._N_E > 0 else range_span
+            )
+        else:
+            self._position_res = position_res  # Use provided value
         self._time_range = time_range  # Duración simulación (1000ms)
         self._time_res = time_res  # dt = 0.2ms
 
@@ -499,19 +508,19 @@ class Echeveste2020(SKNMSIMethodABC):
         )
         self._W_EI = self._build_parametric_matrix(
             orientations[: self._N_E],
-            orientations[self._N_E:],
+            orientations[self._N_E :],
             self._a_EI,
             self._d_EI,
         )
         self._W_IE = self._build_parametric_matrix(
-            orientations[self._N_E:],
+            orientations[self._N_E :],
             orientations[: self._N_E],
             self._a_IE,
             self._d_IE,
         )
         self._W_II = self._build_parametric_matrix(
-            orientations[self._N_E:],
-            orientations[self._N_E:],
+            orientations[self._N_E :],
+            orientations[self._N_E :],
             self._a_II,
             self._d_II,
         )
@@ -689,17 +698,41 @@ class Echeveste2020(SKNMSIMethodABC):
             if input_path is None:
                 # Use internal data loader
                 loader = EchevesteDataLoader()
-                self._Sigma_eta = loader.load_noise_covariance()
-                print("Stage 2 parameters loaded from internal data loader")
+                loaded_sigma = loader.load_noise_covariance()
+                # Validate dimensions match current network size
+                if loaded_sigma.shape[0] == self._N:
+                    self._Sigma_eta = loaded_sigma
+                    print(
+                        "Stage 2 parameters loaded from internal data loader"
+                    )
+                else:
+                    print(
+                        f"Warning: Loaded Sigma_eta shape "
+                        f"{loaded_sigma.shape} doesn't match "
+                        f"network size {self._N}"
+                    )
+                    print("Using default noise covariance instead")
+                    self._Sigma_eta = None
             else:
                 # Load from external directory
-                self._Sigma_eta = np.loadtxt(
+                loaded_sigma = np.loadtxt(
                     os.path.join(input_path, "sigma_eta_learn")
                 )
-                print(
-                    "Stage 2 parameters loaded successfully "
-                    "(noise covariance)"
-                )
+                # Validate dimensions match current network size
+                if loaded_sigma.shape[0] == self._N:
+                    self._Sigma_eta = loaded_sigma
+                    print(
+                        "Stage 2 parameters loaded successfully "
+                        "(noise covariance)"
+                    )
+                else:
+                    print(
+                        f"Warning: External Sigma_eta shape "
+                        f"{loaded_sigma.shape} doesn't match "
+                        f"network size {self._N}"
+                    )
+                    print("Using default noise covariance instead")
+                    self._Sigma_eta = None
 
             self._stage2_completed = True
 
@@ -772,10 +805,10 @@ class Echeveste2020(SKNMSIMethodABC):
     def run(
         self,
         *,
-        stimulus_contrast=0.5,  # Contraste del estímulo z en GSM
+        stimulus_contrast=0.5,  # Contraste del estímulo z en GSM (paper default)
         stimulus_orientation=0.0,  # Orientación del estímulo G en GSM
-        noise_level=1.0,  # Nivel de ruido η para inferencia
-        simulation_time=500.0,  # Tiempo de simulación en ms
+        noise_level=1.0,  # Nivel de ruido η para inferencia (paper default)
+        simulation_time=1000.0,  # Tiempo de simulación en ms
         **kwargs,  # Parámetros adicionales
     ):
         """Run the SSN simulation."""
@@ -786,21 +819,65 @@ class Echeveste2020(SKNMSIMethodABC):
                 Use train() or load_parameters() method first."""
             )
 
-        # Generacion del estimulo
-        # Main paper Eq. 1-7: I = z * G
-        # donde z es contraste, G es campo orientado
-        stimulus = self._generate_gsm_stimulus(
-            stimulus_contrast, stimulus_orientation  # Parámetros de GSM model
-        )
+        try:
+            # Generacion del estimulo
+            # Main paper Eq. 1-7: I = z * G
+            # donde z es contraste, G es campo orientado
+            stimulus = self._generate_gsm_stimulus(
+                stimulus_contrast,
+                stimulus_orientation,  # Parámetros de GSM model
+            )
 
-        # Construir matriz de conectividad
-        # Main paper Eq. 10:
-        # W_XY(θi,θj) = a_XY * exp[(cos(2(θi-θj))-1)/d_XY²]
-        # MEJORA vs Echeveste: Guardamos matrices
-        # W_EE, W_EI, W_IE, W_II por separado
-        # Ventaja: Memoria eficiente, acceso rápido
-        # por bloques, debug más fácil
-        W = self.build_connectivity_matrix()
+            # Validate stimulus dimensions
+            expected_stimulus_size = self._N_E + self._N_I
+            if len(stimulus) != expected_stimulus_size:
+                raise ValueError(
+                    f"Stimulus dimension mismatch. Expected {expected_stimulus_size}, "
+                    f"got {len(stimulus)}. Network: {self._N_E}E + {self._N_I}I = {expected_stimulus_size} total."
+                )
+
+        except Exception as e:
+            if (
+                "dimension mismatch" in str(e).lower()
+                or "stimulus" in str(e).lower()
+            ):
+                raise  # Re-raise stimulus generation errors with clear message
+            else:
+                raise RuntimeError(
+                    f"Failed to generate stimulus for SSN simulation: {e}. "
+                    f"Network configuration: {self._N_E}E + {self._N_I}I = {self._N_E + self._N_I} total."
+                ) from e
+
+        try:
+            # Construir matriz de conectividad
+            # Main paper Eq. 10:
+            # W_XY(θi,θj) = a_XY * exp[(cos(2(θi-θj))-1)/d_XY²]
+            # MEJORA vs Echeveste: Guardamos matrices
+            # W_EE, W_EI, W_IE, W_II por separado
+            # Ventaja: Memoria eficiente, acceso rápido
+            # por bloques, debug más fácil
+            W = self.build_connectivity_matrix()
+
+            # Validate connectivity matrix dimensions
+            expected_W_shape = (self._N_E + self._N_I, self._N_E + self._N_I)
+            if W.shape != expected_W_shape:
+                raise ValueError(
+                    f"Connectivity matrix dimension mismatch. Expected {expected_W_shape}, "
+                    f"got {W.shape}. Network: {self._N_E}E + {self._N_I}I = {self._N_E + self._N_I} total."
+                )
+
+        except Exception as e:
+            if (
+                "dimension mismatch" in str(e).lower()
+                or "connectivity" in str(e).lower()
+            ):
+                raise  # Re-raise connectivity matrix errors with clear message
+            else:
+                raise RuntimeError(
+                    f"Failed to build connectivity matrix: {e}. "
+                    f"Network configuration: {self._N_E}E + {self._N_I}I = {self._N_E + self._N_I} total. "
+                    f"Ensure model parameters are properly loaded."
+                ) from e
 
         # Main paper Eq. 8: Variables de estado u_α(t=0)
         # Empieza desde estado de reposo para todas las neuronas
@@ -872,6 +949,9 @@ class Echeveste2020(SKNMSIMethodABC):
         u_trajectory = np.zeros((simulation_steps, self._N))
 
         # Loop temporal principal (siguiendo network_evolution de Echeveste)
+        simulation_successful = True
+        actual_steps = simulation_steps
+
         for step in range(simulation_steps):
             # Calcula actividad neuronal usando
             # función supralineal (Main paper, Eq. 9)
@@ -880,7 +960,7 @@ class Echeveste2020(SKNMSIMethodABC):
                 u_old[: self._N_E]
             )  # Excitatorias
             r_i = self._integrator.f.supralinear_activation(
-                u_old[self._N_E:]
+                u_old[self._N_E :]
             )  # Inhibitorias
             _ = np.concatenate([r_e, r_i])  # noqa: F841
 
@@ -897,7 +977,7 @@ class Echeveste2020(SKNMSIMethodABC):
             # BrainPy (Main paper, Eq. 8)
             # MEJORA: Usamos integrador BrainPy en vez de implementación manual
             # du_α/dt = (-u_α + Σ_β W_αβ r_β + h_α + η_α) / τ_α
-            u_e_old, u_i_old = u_old[: self._N_E], u_old[self._N_E:]
+            u_e_old, u_i_old = u_old[: self._N_E], u_old[self._N_E :]
             u_e_new, u_i_new = self._integrator(
                 u_e_old, u_i_old, step * dt, W, stimulus, eta_old
             )
@@ -912,22 +992,34 @@ class Echeveste2020(SKNMSIMethodABC):
 
             # Verificación de estabilidad numérica (como en código original)
             if np.linalg.norm(u_new) > 1000:
-                print(f"Activity is exploding. Step: {step}")
+                simulation_successful = False
+                actual_steps = step  # Explosion occurred at this step
+                print(
+                    f"Warning: Activity exploded at step {step}/{simulation_steps}. "
+                    f"Using trajectory up to step {step-1}."
+                )
                 break
 
-        # Crear estructura tipo BrainPy para compatibilidad
-        trajectory = [u_trajectory, None]  # [u(t), η(t)] - η no se guarda
+        # Handle simulation results based on success/failure
+        if not simulation_successful:
+            # Truncate trajectory to actual simulated steps
+            u_trajectory_used = u_trajectory[:actual_steps]
+            if actual_steps == 0:
+                raise RuntimeError(
+                    f"Simulation failed immediately. Check network parameters: "
+                    f"contrast={stimulus_contrast}, noise_level={noise_level}. "
+                    f"Try reducing noise_level or stimulus_contrast."
+                )
+        else:
+            u_trajectory_used = u_trajectory
 
         # EXTRACCIÓN DE ACTIVIDAD NEURONAL
-        # trajectory contiene [u(t), η(t)] para todos los tiempos
-        u_trajectory = trajectory[0]  # Potenciales de membrana u_α(t)
-
         # Calcular actividad r_α(t) = k * [u_α(t)]_+^n (Main paper Eq. 9)
         excitatory_activity = self._integrator.f.supralinear_activation(
-            u_trajectory[:, : self._N_E]  # Solo neuronas excitatorias
+            u_trajectory_used[:, : self._N_E]  # Solo neuronas excitatorias
         )
         inhibitory_activity = self._integrator.f.supralinear_activation(
-            u_trajectory[:, self._N_E:]  # Solo neuronas inhibitorias
+            u_trajectory_used[:, self._N_E :]  # Solo neuronas inhibitorias
         )
 
         response = {
@@ -937,6 +1029,9 @@ class Echeveste2020(SKNMSIMethodABC):
             "inhibitory": inhibitory_activity,
         }
 
+        # Note: temporal dimension adjustment for truncated simulations
+        # is handled by the custom _make_result method
+
         extra = {
             # Variable z del modelo GSM (Eq. 2)
             "stimulus_contrast": stimulus_contrast,
@@ -944,12 +1039,76 @@ class Echeveste2020(SKNMSIMethodABC):
             "stimulus_orientation": stimulus_orientation,
             # Nivel ruido η (Supp. Sec. 2.3)
             "noise_level": noise_level,
+            # Simulation status information
+            "simulation_successful": simulation_successful,
+            "actual_simulation_steps": actual_steps,
+            "requested_simulation_steps": simulation_steps,
+            "actual_simulation_time": actual_steps * self._time_res,
+            "requested_simulation_time": simulation_time,
         }
 
         return (
             response,
             extra,
         )  # Retorna actividad y parámetros del experimento
+
+    def _make_result(
+        self,
+        modes_dict,
+        time_range,
+        position_range,
+        time_res,
+        position_res,
+        causes,
+        run_parameters,
+        extra,
+        **kwargs,
+    ):
+        """
+        Custom result maker that handles truncated simulations.
+
+        This method is called by the parent class to create the NDResult.
+        It adjusts temporal dimensions if the simulation was truncated.
+        """
+        from ..core.ndresult import NDResult
+
+        # Handle explosion cases by removing problematic last data point
+        if isinstance(extra, dict) and not extra.get(
+            "simulation_successful", True
+        ):
+            # For exploded simulations, always remove the last data point
+            # This fixes the systematic off-by-one issue
+            if hasattr(modes_dict, "values") and modes_dict:
+                print("DEBUG: Explosion detected - removing last point")
+                truncated_modes_dict = {}
+                for key, data in modes_dict.items():
+                    if hasattr(data, "__len__") and len(data) > 0:
+                        truncated_modes_dict[key] = data[:-1]  # Remove last
+                    else:
+                        truncated_modes_dict[key] = data
+                modes_dict = truncated_modes_dict
+
+                # Fix floating point precision issue in time_range calculation
+                # The validation uses: expected = int(time_span / time_res)
+                # To ensure int(time_span / time_res) == new_length,
+                # we add a small epsilon to compensate for floating point errors
+                new_length = len(next(iter(modes_dict.values())))
+                epsilon = 1e-10
+                new_time_max = new_length * time_res + epsilon
+                time_range = (0, new_time_max)
+
+        # Use standard creation (validation should pass now)
+        return NDResult.from_modes_dict(
+            modes_dict=modes_dict,
+            time_range=time_range,
+            position_range=position_range,
+            time_res=time_res,
+            position_res=position_res,
+            causes=causes,
+            run_parameters=run_parameters,
+            extra=extra,
+            **kwargs,
+        )
 
     def parametric_connectivity(self, theta_i, theta_j, a_xy, d_xy):
         """
@@ -1029,9 +1188,9 @@ class Echeveste2020(SKNMSIMethodABC):
         ):
             W_full = np.zeros((self._N, self._N))
             W_full[: self._N_E, : self._N_E] = self._W_EE
-            W_full[: self._N_E, self._N_E:] = self._W_EI
-            W_full[self._N_E:, : self._N_E] = self._W_IE
-            W_full[self._N_E:, self._N_E:] = self._W_II
+            W_full[: self._N_E, self._N_E :] = self._W_EI
+            W_full[self._N_E :, : self._N_E] = self._W_IE
+            W_full[self._N_E :, self._N_E :] = self._W_II
             return W_full
 
         # Genera orientaciones preferidas para ring topology
@@ -1058,28 +1217,28 @@ class Echeveste2020(SKNMSIMethodABC):
             return sign * a * np.exp((np.cos(2 * delta_theta) - 1) / d**2)
 
         # Bloques matriciales (all positive, signs applied in dynamics)
-        W[0: self._N_E, 0: self._N_E] = connectivity_block(
+        W[0 : self._N_E, 0 : self._N_E] = connectivity_block(
             theta_e,
             theta_e,
             params["a_EE"],
             params["d_EE"],
             sign=1,
         )
-        W[0: self._N_E, self._N_E: self._N] = connectivity_block(
+        W[0 : self._N_E, self._N_E : self._N] = connectivity_block(
             theta_e,
             theta_i,
             params["a_EI"],
             params["d_EI"],
             sign=1,
         )
-        W[self._N_E: self._N, 0: self._N_E] = connectivity_block(
+        W[self._N_E : self._N, 0 : self._N_E] = connectivity_block(
             theta_i,
             theta_e,
             params["a_IE"],
             params["d_IE"],
             sign=1,
         )
-        W[self._N_E: self._N, self._N_E: self._N] = connectivity_block(
+        W[self._N_E : self._N, self._N_E : self._N] = connectivity_block(
             theta_i,
             theta_i,
             params["a_II"],
@@ -1107,29 +1266,62 @@ class Echeveste2020(SKNMSIMethodABC):
 
         Implementation uses integrated GSM model from generative module.
         """
-        # Initialize GSM if not already created
-        if not hasattr(self, "_gsm"):
-            self._gsm = self._create_gsm()
+        try:
+            # Initialize GSM if not already created
+            if not hasattr(self, "_gsm"):
+                self._gsm = self._create_gsm()
 
-        # Generate stimulus using GSM
-        # Maps contrast (0-1) to Echeveste's contrast levels (0-4)
-        contrast_level = contrast * 4.0
+            # Note: orientation parameter reserved for future orientation-specific
+            # stimulus generation. Currently GSM generates orientation-distributed
+            # stimuli based on contrast level only.
+            _ = orientation  # Suppress unused parameter warning
 
-        # Generate single stimulus sample
-        h_samples = self._gsm.get_h_for_contrast_level(
-            contrast_level, n_samples=1
-        )
+            # Generate stimulus using GSM
+            # Maps contrast (0-1) to Echeveste's contrast levels (0-4)
+            contrast_level = contrast * 4.0
 
-        # The GSM returns h for orientations (50 dimensions)
-        # SSN needs input for both E and I populations (100 dimensions)
-        # Following Echeveste: both E and I get the same external input
-        h_orientation = h_samples[0]  # Shape: (50,)
+            # Generate single stimulus sample
+            h_samples = self._gsm.get_h_for_contrast_level(
+                contrast_level, n_samples=1
+            )
 
-        # Replicate for both E and I populations
-        # Shape: (100,)
-        h_full = np.concatenate([h_orientation, h_orientation])
+            # Extract stimulus vector
+            h_stimulus = h_samples[0]
 
-        return h_full
+            # Validate stimulus dimensions match network size
+            expected_size = self._N_E + self._N_I
+
+            if len(h_stimulus) != expected_size:
+                # If GSM generates orientation-only stimulus (N_E dimensions),
+                # replicate for both E and I populations
+                if len(h_stimulus) == self._N_E:
+                    h_full = np.concatenate([h_stimulus, h_stimulus])
+                    if len(h_full) != expected_size:
+                        raise ValueError(
+                            f"Stimulus dimension mismatch after replication. "
+                            f"Expected {expected_size}, got {len(h_full)}. "
+                            f"Network: {self._N_E}E + {self._N_I}I = {expected_size} total."
+                        )
+                    return h_full
+                else:
+                    raise ValueError(
+                        f"Stimulus dimension mismatch. Expected {expected_size} "
+                        f"or {self._N_E} (for replication), got {len(h_stimulus)}. "
+                        f"Network configuration: {self._N_E}E + {self._N_I}I = {expected_size} total. "
+                        f"Please ensure GSM is configured for the correct network size."
+                    )
+
+            return h_stimulus
+
+        except Exception as e:
+            if "dimension mismatch" in str(e).lower():
+                raise  # Re-raise our custom dimension errors
+            else:
+                raise RuntimeError(
+                    f"Failed to generate GSM stimulus: {e}. "
+                    f"Network size: {self._N_E}E + {self._N_I}I = {self._N_E + self._N_I} total. "
+                    f"Check that the GSM module is properly configured."
+                ) from e
 
     def _create_gsm(self):
         """Create GSM instance for stimulus generation.
@@ -1272,12 +1464,32 @@ class Echeveste2020(SKNMSIMethodABC):
         # Paso fundamental: necesitamos la respuesta de estado estable del SSN
         # que representa muestras de la distribución posterior P(z,G|I)
         if network_activity is None:
-            if stimulus is not None:
+            # Try to extract network activity from kwargs (when called by parent class)
+            if "excitatory" in kwargs and "inhibitory" in kwargs:
+                # Extract final timestep from simulation results
+                exc_activity = kwargs["excitatory"]
+                inh_activity = kwargs["inhibitory"]
+
+                # Use the final timestep as steady-state activity
+                if exc_activity.ndim > 1:
+                    final_exc = exc_activity[-1]  # Last timestep
+                else:
+                    final_exc = exc_activity
+
+                if inh_activity.ndim > 1:
+                    final_inh = inh_activity[-1]  # Last timestep
+                else:
+                    final_inh = inh_activity
+
+                network_activity = np.concatenate([final_exc, final_inh])
+
+            elif stimulus is not None:
                 # Generar respuesta de red al estímulo usando dinámica SSN
                 network_activity = self._generate_network_response(stimulus)
             else:
                 raise ValueError(
-                    "Either network_activity or stimulus " "must be provided"
+                    "Either network_activity or stimulus must be provided, "
+                    "or excitatory/inhibitory activity must be in kwargs"
                 )
 
         # Validar dimensiones de actividad de red
@@ -1309,16 +1521,90 @@ class Echeveste2020(SKNMSIMethodABC):
             peaks_info, posterior_dist, confidence_threshold
         )
 
-        # PASO 4: Mapear actividad de red a orientaciones de causas
-        # Usa la topología en anillo del SSN para
-        # extraer orientaciones preferidas
+        # Return number of causes as scalar for parent class compatibility
+        # The parent class expects a scalar value for the 'causes' field
+        # Full results can be obtained by calling calculate_causes_detailed()
+        return causal_results["num_causes"]
+
+    def calculate_causes_detailed(
+        self,
+        network_activity=None,
+        stimulus=None,
+        contrast_range=None,
+        **kwargs,
+    ):
+        """
+        Get detailed causal inference results (full version of calculate_causes).
+
+        This method returns the complete dictionary of causal inference results,
+        including cause positions, contrasts, confidence scores, and posterior
+        distribution information.
+
+        Parameters
+        ----------
+        Same as calculate_causes()
+
+        Returns
+        -------
+        dict
+            Complete dictionary containing all causal inference results:
+            - 'num_causes', 'cause_positions', 'cause_contrasts', etc.
+        """
+        # Use the same implementation but temporarily store full results
+        # by duplicating the logic without the scalar return
+
+        # Extract parameters
+        peak_threshold = kwargs.get("peak_threshold", 0.1)
+        peak_distance = kwargs.get("peak_distance", 10)
+        confidence_threshold = kwargs.get("confidence_threshold", 0.5)
+
+        if contrast_range is None:
+            contrast_range = np.linspace(0.0, 5.0, 201)
+
+        # Get network activity (same logic as calculate_causes)
+        if network_activity is None:
+            if "excitatory" in kwargs and "inhibitory" in kwargs:
+                exc_activity = kwargs["excitatory"]
+                inh_activity = kwargs["inhibitory"]
+
+                final_exc = (
+                    exc_activity[-1] if exc_activity.ndim > 1 else exc_activity
+                )
+                final_inh = (
+                    inh_activity[-1] if inh_activity.ndim > 1 else inh_activity
+                )
+                network_activity = np.concatenate([final_exc, final_inh])
+
+            elif stimulus is not None:
+                network_activity = self._generate_network_response(stimulus)
+            else:
+                raise ValueError(
+                    "Either network_activity or stimulus must be provided, "
+                    "or excitatory/inhibitory activity must be in kwargs"
+                )
+
+        # Validate dimensions
+        if len(network_activity) != self._N:
+            raise ValueError(
+                f"Network activity must have length {self._N}, got {len(network_activity)}"
+            )
+
+        # Run the full causal inference pipeline
+        posterior_dist = self._extract_posterior_distribution(
+            network_activity, contrast_range
+        )
+        peaks_info = self._detect_posterior_peaks(
+            posterior_dist, peak_threshold, peak_distance
+        )
+        causal_results = self._extract_causal_statistics(
+            peaks_info, posterior_dist, confidence_threshold
+        )
         cause_orientations = self._extract_cause_orientations(
             network_activity, causal_results["cause_contrasts"]
         )
 
-        # Compilar resultados finales de inferencia causal
-        # Formato compatible con análisis experimental (Fig. 7 del paper)
-        results = {
+        # Return full results dictionary
+        return {
             "num_causes": causal_results["num_causes"],
             "cause_positions": cause_orientations,
             "cause_contrasts": causal_results["cause_contrasts"],
@@ -1330,8 +1616,6 @@ class Echeveste2020(SKNMSIMethodABC):
             },
             "posterior_stats": causal_results["posterior_stats"],
         }
-
-        return results
 
     def _generate_network_response(self, stimulus):
         """
