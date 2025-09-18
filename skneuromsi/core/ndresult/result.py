@@ -244,9 +244,11 @@ class NDResult:
 
         # check causes
         causes = self._causes
-        if not (causes is None or isinstance(causes, (int, float, np.number))):
+        if not (
+            causes is None or isinstance(causes, (int, float, np.number, dict))
+        ):
             raise ValueError(
-                f"causes must be, int, float or None, got {type(causes)}"
+                f"causes must be, int, float, dict or None, got {type(causes)}"
             )
 
     @classmethod
