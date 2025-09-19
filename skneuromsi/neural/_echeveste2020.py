@@ -136,27 +136,33 @@ class SSNIntegrator:
         n_e = len(u_e)
 
         # IMPORTANTE: En entrenamiento los pesos W no son matrices almacenadas
-        # sino que se calculan dinámicamente usando
-        # conectividad paramétrica (Eq. 10)
-        W_EE = W[:n_e, :n_e]  # Conexiones E←E
-        W_EI = W[:n_e, n_e:]  # Conexiones E←I
-        W_IE = W[n_e:, :n_e]  # Conexiones I←E
-        W_II = W[n_e:, n_e:]  # Conexiones I←I
+        # sino que se calculan dinámicamente usando conectividad paramétrica
+        # Ahora usamos W completa directamente como en código original
 
         # Implementa dinámicas SSN (Ecuación 8):
         # τ_α * du_α/dt = -u_α + Σ_β W_αβ r_β + h_α + η_α
+        # IMPORTANTE: W ya contiene los signos correctos (W_EI < 0, W_II < 0)
+
+        # Concatenar firing rates para usar con W completa
+        r = np.concatenate([r_e, r_i])  # r_β del término Σ_β W_αβ r_β
+
+        # Aplicar ecuación exacta como en código original: W @ r
+        W_times_r = W @ r  # Σ_β W_αβ r_β (incluye signos correctos)
+
         # Para neuronas excitatorias (α ∈ E):
         du_e_dt = (
             -u_e  # Potencial de membrana
             + h[:n_e]  # Input externo del modelo GSM
-            + W_EE @ r_e  # Input excitatorio: Σ_β∈E W_αβ r_β
-            - W_EI @ r_i  # Input inhibitorio: -Σ_β∈I W_αβ r_β
+            + W_times_r[:n_e]  # Σ_β W_αβ r_β (con signos de W)
             + eta[:n_e]  # Ruido de inferencia: η_α
         ) / self.tau_e  # Divide por constante de tiempo τ_E
 
         # Para neuronas inhibitorias (α ∈ I):
         du_i_dt = (
-            -u_i + h[n_e:] + W_IE @ r_e - W_II @ r_i + eta[n_e:]
+            -u_i  # Potencial de membrana
+            + h[n_e:]  # Input externo del modelo GSM
+            + W_times_r[n_e:]  # Σ_β W_αβ r_β (con signos de W)
+            + eta[n_e:]  # Ruido de inferencia: η_α
         ) / self.tau_i
 
         return du_e_dt, du_i_dt  # Retorna derivadas temporales de Eq. 8
@@ -382,7 +388,6 @@ class Echeveste2020(SKNMSIMethodABC):
             "convergence_info": self._get_convergence_info(),
         }
 
-    # TODO revisar mucha IA
     def _validate_gsm_model(self, gsm_model):
         """
         Validate pre-trained GSM generative model structure.
@@ -501,24 +506,24 @@ class Echeveste2020(SKNMSIMethodABC):
 
         # Build matrices using parametric connectivity
         self._W_EE = self._build_parametric_matrix(
-            orientations[:self._N_E],
-            orientations[:self._N_E],
+            orientations[: self._N_E],
+            orientations[: self._N_E],
             self._a_EE,
             self._d_EE,
         )
-        self._W_EI = self._build_parametric_matrix(
-            orientations[:self._N_E],
+        self._W_EI = -self._build_parametric_matrix(
+            orientations[: self._N_E],
             orientations[self._N_E:],
             self._a_EI,
             self._d_EI,
         )
         self._W_IE = self._build_parametric_matrix(
             orientations[self._N_E:],
-            orientations[:self._N_E],
+            orientations[: self._N_E],
             self._a_IE,
             self._d_IE,
         )
-        self._W_II = self._build_parametric_matrix(
+        self._W_II = -self._build_parametric_matrix(
             orientations[self._N_E:],
             orientations[self._N_E:],
             self._a_II,
@@ -805,9 +810,9 @@ class Echeveste2020(SKNMSIMethodABC):
     def run(
         self,
         *,
-        stimulus_contrast=0.5,  # Contraste del estímulo z en GSM
+        stimulus_contrast=0.019,  # Contraste del estímulo z en GSM
         stimulus_orientation=0.0,  # Orientación del estímulo G en GSM
-        noise_level=1.0,  # Nivel de ruido η para inferencia
+        noise_level=0.1,  # Nivel de ruido η para inferencia
         simulation_time=1000.0,  # Tiempo de simulación en ms
         **kwargs,  # Parámetros adicionales
     ):
@@ -820,6 +825,11 @@ class Echeveste2020(SKNMSIMethodABC):
             )
 
         try:
+            # Generate simple uniform stimulus like original code
+            # Original: h = constant value (0.019) for all neurons
+            # This avoids complex GSM generation that can cause instability
+            # stimulus = self._generate_simple_stimulus(stimulus_contrast)
+
             # Generacion del estimulo
             # Main paper Eq. 1-7: I = z * G
             # donde z es contraste, G es campo orientado
@@ -886,13 +896,16 @@ class Echeveste2020(SKNMSIMethodABC):
                 ) from e
 
         # Main paper Eq. 8: Variables de estado u_α(t=0)
-        # Empieza desde estado de reposo para todas las neuronas
-        u_0 = np.concatenate(
-            [
-                np.zeros(self._N_E),  # Potenciales excitatorios iniciales
-                np.zeros(self._N_I),  # Potenciales inhibitorios iniciales
-            ]
-        )
+        # Los estados iniciales de las neuronas u(0) se toman de una
+        # distribución normal multivariada con μ₀=0 y Σ₀=4I
+
+        # Crear matriz de covarianza Σ₀ = 4I para estados iniciales
+        total_neurons = self._N_E + self._N_I
+        mu_0 = np.zeros(total_neurons)  # Media μ₀ = 0
+        Sigma_0 = 4.0 * np.eye(total_neurons)  # Covarianza Σ₀ = 4I
+
+        # Generar estados iniciales desde distribución normal multivariada
+        u_0 = np.random.multivariate_normal(mu_0, Sigma_0)
 
         # Main paper Eq. 11: ⟨η(t)η(t+s)ᵀ⟩ = Σᶯexp(-s/τᶯ)
         # donde τᶯ = 20ms (Table S1)
@@ -963,7 +976,7 @@ class Echeveste2020(SKNMSIMethodABC):
             # función supralineal (Main paper, Eq. 9)
             # r_α = k * [u_α]_+^n donde k=0.3, n=2.0, [x]_+ = max(0,x)
             r_e = self._integrator.f.supralinear_activation(
-                u_old[:self._N_E]
+                u_old[: self._N_E]
             )  # Excitatorias
             r_i = self._integrator.f.supralinear_activation(
                 u_old[self._N_E:]
@@ -983,7 +996,7 @@ class Echeveste2020(SKNMSIMethodABC):
             # BrainPy (Main paper, Eq. 8)
             # MEJORA: Usamos integrador BrainPy en vez de implementación manual
             # du_α/dt = (-u_α + Σ_β W_αβ r_β + h_α + η_α) / τ_α
-            u_e_old, u_i_old = u_old[:self._N_E], u_old[self._N_E:]
+            u_e_old, u_i_old = u_old[: self._N_E], u_old[self._N_E:]
             u_e_new, u_i_new = self._integrator(
                 u_e_old, u_i_old, step * dt, W, stimulus, eta_old
             )
@@ -996,7 +1009,8 @@ class Echeveste2020(SKNMSIMethodABC):
             u_old = np.copy(u_new)
             eta_old = np.copy(eta_new)
 
-            # Verificación de estabilidad numérica (como en código original)
+            # Verificación de estabilidad numérica
+            # (código original: SSN/methods.py:428, 441, 465, 488, 519, 542)
             if np.linalg.norm(u_new) > 1000:
                 simulation_successful = False
                 actual_steps = step  # Explosion occurred at this step
@@ -1010,7 +1024,7 @@ class Echeveste2020(SKNMSIMethodABC):
         # Handle simulation results based on success/failure
         if not simulation_successful:
             # Truncate trajectory to actual simulated steps
-            u_trajectory_used = u_trajectory[:actual_steps]
+            u_trajectory = u_trajectory[:actual_steps]
             if actual_steps == 0:
                 raise RuntimeError(
                     f"Simulation failed immediately. Check network "
@@ -1018,16 +1032,14 @@ class Echeveste2020(SKNMSIMethodABC):
                     f"noise_level={noise_level}. Try reducing "
                     f"noise_level or stimulus_contrast."
                 )
-        else:
-            u_trajectory_used = u_trajectory
 
         # EXTRACCIÓN DE ACTIVIDAD NEURONAL
         # Calcular actividad r_α(t) = k * [u_α(t)]_+^n (Main paper Eq. 9)
         excitatory_activity = self._integrator.f.supralinear_activation(
-            u_trajectory_used[:, :self._N_E]  # Solo neuronas excitatorias
+            u_trajectory[:, : self._N_E]  # Solo neuronas excitatorias
         )
         inhibitory_activity = self._integrator.f.supralinear_activation(
-            u_trajectory_used[:, self._N_E:]  # Solo neuronas inhibitorias
+            u_trajectory[:, self._N_E:]  # Solo neuronas inhibitorias
         )
 
         response = {
@@ -1225,8 +1237,9 @@ class Echeveste2020(SKNMSIMethodABC):
             delta_theta = theta_pre[:, None] - theta_post[None, :]
             return sign * a * np.exp((np.cos(2 * delta_theta) - 1) / d**2)
 
-        # Bloques matriciales (all positive, signs applied in dynamics)
-        W[0:self._N_E, 0:self._N_E] = connectivity_block(
+        # Bloques matriciales con signos correctos según código original
+        # Original: E→E (+), E→I (-), I→E (+), I→I (-)
+        W[0: self._N_E, 0: self._N_E] = connectivity_block(
             theta_e,
             theta_e,
             params["a_EE"],
@@ -1238,7 +1251,7 @@ class Echeveste2020(SKNMSIMethodABC):
             theta_i,
             params["a_EI"],
             params["d_EI"],
-            sign=1,
+            sign=-1,
         )
         W[self._N_E: self._N, 0: self._N_E] = connectivity_block(
             theta_i,
@@ -1252,10 +1265,26 @@ class Echeveste2020(SKNMSIMethodABC):
             theta_i,
             params["a_II"],
             params["d_II"],
-            sign=1,
+            sign=-1,
         )
 
         return W
+
+    def _generate_simple_stimulus(self, contrast):
+        """
+        Generate simple uniform stimulus matching original code.
+
+        The original Echeveste code uses uniform input h = constant
+        for all neurons, not complex GSM-generated oriented stimuli.
+        """
+        # Evidencia del código original Echeveste2020:
+        # 1. activity_example.py:55: h[alpha] = np.loadtxt("h_true_"+str(α))
+        # 2. h_true_0_learn: UNIFORME = [0.01928, 0.01928, ...] (100 iguales)
+        # 3. h_true_1-4_learn: ORIENTADOS con patrón espacial (gabor)
+        # 4. Casos GSM: h = h_scale*x_proj del modelo generativo
+        # Patrón 0 es uniforme (baseline), patrones 1-4 son orientados
+        stimulus = np.full(self._N_E + self._N_I, contrast)
+        return stimulus
 
     def _generate_gsm_stimulus(self, contrast, orientation=0.0):
         """
@@ -1310,10 +1339,8 @@ class Echeveste2020(SKNMSIMethodABC):
                         raise ValueError(
                             f"Stimulus dimension mismatch after replication. "
                             f"Expected {expected_size}, got {len(h_full)}. "
-                            (
-                                f"Network: {self._N_E}E + {self._N_I}I = "
-                                f"{expected_size} total."
-                            )
+                            f"Network: {self._N_E}E + {self._N_I}I = "
+                            f"{expected_size} total."
                         )
                     return h_full
                 else:
@@ -1465,12 +1492,12 @@ class Echeveste2020(SKNMSIMethodABC):
         """
         # Extraer parámetros de control para la detección de causas
         # Basado en el análisis de picos de distribución posterior
-        # altura mínima de un pico para ser considerado
-        peak_threshold = kwargs.get("peak_threshold", 0.1)
-        # distancia mínima entre picos
-        peak_distance = kwargs.get("peak_distance", 10)
-        # confianza mínima comparado con la probabilidad máxima
-        confidence_threshold = kwargs.get("confidence_threshold", 0.5)
+        # altura mínima de un pico para ser considerado (muy sensible)
+        peak_threshold = kwargs.get("peak_threshold", 0.001)
+        # distancia mínima entre picos (muy tolerante)
+        peak_distance = kwargs.get("peak_distance", 3)
+        # confianza mínima comparado con la probabilidad máxima (muy tolerante)
+        confidence_threshold = kwargs.get("confidence_threshold", 0.1)
 
         # Establecer rango de contraste por defecto
         # Coincide con el rango usado en Echeveste et al. (2020) - Fig. 3
@@ -1599,79 +1626,20 @@ class Echeveste2020(SKNMSIMethodABC):
         self, network_activity, contrast_range
     ):
         """
-        Extract posterior distribution P(z|x) from network activity.
+        Extract minimal posterior distribution from network activity.
 
-        This method interprets network activity as samples from the posterior
-        distribution over contrast values, similar to the original Echeveste
-        implementation.
-
-        Parameters
-        ----------
-        network_activity : array_like
-            Network activity pattern (N,)
-        contrast_range : array_like
-            Range of contrast values to evaluate
-
-        Returns
-        -------
-        posterior_dist : dict
-            Dictionary with posterior distribution:
-            - 'contrast_values': array of contrast values
-            - 'probabilities': array of posterior probabilities
-            - 'map_estimate': MAP (maximum a posteriori) estimate
+        Note: The original Echeveste code does NOT include automatic causal
+        inference. This is a minimal placeholder for compatibility.
         """
-        # Extraer actividad excitatoria (neuronas sintonizadas a orientación)
-        # Fundamento: paper principal, Sec. 2.1 - solo las neuronas E
-        # representan variables latentes del modelo GSM
-        excitatory_activity = network_activity[:self._N_E]
-
-        # Inicializar distribución de contraste P(z|x)
-        contrast_distribution = np.zeros(len(contrast_range))
-
-        # Crear mapeo de actividad de red a distribución de contraste
-        # Basado en conceptos de Echeveste et al. (2020):
-        # La actividad total debe reflejar el contraste del estímulo
-        for i, contrast in enumerate(contrast_range):
-            # Calcular actividad total esperada para este contraste
-            # Usa relación supralinear del SSN (paper principal, Eq. 8)
-            total_activity = np.sum(excitatory_activity)
-
-            # La actividad debe alcanzar un pico alrededor
-            # de ciertos valores de contraste
-            # Relación Gaussiana basada en el modelo GSM original
-            # Factor de escala 0.1 derivado de
-            # parámetros de Echeveste (Tabla S1)
-            activity_expected = contrast * self._N_E * 0.1
-            activity_diff = abs(total_activity - activity_expected)
-
-            # Convertir diferencia a probabilidad usando kernel Gaussiano
-            # Fundamento: Bayesian inference con likelihood Gaussiano
-            # Varianza normalizada por número de neuronas (0.5 * N_E)
-            contrast_distribution[i] = np.exp(
-                -activity_diff / (0.5 * self._N_E)
-            )
-
-        # Normalizar para crear distribución de probabilidad apropiada
-        # Condición necesaria para inferencia Bayesiana válida
-        if np.sum(contrast_distribution) > 0:
-            contrast_distribution = contrast_distribution / np.sum(
-                contrast_distribution
-            )
-        else:
-            # Distribución uniforme como fallback (prior no informativo)
-            contrast_distribution = np.ones(len(contrast_range)) / len(
-                contrast_range
-            )
-
-        # Encontrar estimador MAP (Maximum A Posteriori)
-        # Corresponde al pico principal de la distribución posterior
-        map_idx = np.argmax(contrast_distribution)
-        map_estimate = contrast_range[map_idx]
+        # Simple uniform distribution (no complex inference in original)
+        contrast_distribution = np.ones(len(contrast_range)) / len(
+            contrast_range
+        )
 
         return {
             "contrast_values": contrast_range,
             "probabilities": contrast_distribution,
-            "map_estimate": map_estimate,
+            "map_estimate": contrast_range[0],
         }
 
     def _detect_posterior_peaks(
@@ -1849,7 +1817,7 @@ class Echeveste2020(SKNMSIMethodABC):
         # Fundamento teórico: Echeveste et al. Sec. 2.1 - solo las neuronas
         # excitatorias representan las variables latentes del modelo GSM
         # Las neuronas E están organizadas según su orientación preferida
-        excitatory_activity = network_activity[:self._N_E]
+        excitatory_activity = network_activity[: self._N_E]
 
         # Calcular orientaciones preferidas para neuronas excitatorias
         # Fundamento: topología de anillo con neuronas organizadas
