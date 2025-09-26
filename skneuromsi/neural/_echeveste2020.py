@@ -514,19 +514,19 @@ class Echeveste2020(SKNMSIMethodABC):
         )
         self._W_EI = -self._build_parametric_matrix(
             orientations[: self._N_E],
-            orientations[self._N_E:],
+            orientations[self._N_E :],
             self._a_EI,
             self._d_EI,
         )
         self._W_IE = self._build_parametric_matrix(
-            orientations[self._N_E:],
+            orientations[self._N_E :],
             orientations[: self._N_E],
             self._a_IE,
             self._d_IE,
         )
         self._W_II = -self._build_parametric_matrix(
-            orientations[self._N_E:],
-            orientations[self._N_E:],
+            orientations[self._N_E :],
+            orientations[self._N_E :],
             self._a_II,
             self._d_II,
         )
@@ -648,8 +648,10 @@ class Echeveste2020(SKNMSIMethodABC):
                 # CRITICAL: Also load exact matrix to avoid instability
                 try:
                     self._W_exact = loader.load_exact_connectivity_matrix()
-                    print(f"Also loaded exact matrix: "
-                          f"shape {self._W_exact.shape}")
+                    print(
+                        f"Also loaded exact matrix: "
+                        f"shape {self._W_exact.shape}"
+                    )
                 except FileNotFoundError:
                     print("Warning: No exact matrix found in internal data")
             else:
@@ -686,8 +688,10 @@ class Echeveste2020(SKNMSIMethodABC):
                 try:
                     w_exact = np.loadtxt(os.path.join(input_path, "w_learn"))
                     self._W_exact = w_exact
-                    print(f"Also loaded exact matrix w_learn: "
-                          f"shape {w_exact.shape}")
+                    print(
+                        f"Also loaded exact matrix w_learn: "
+                        f"shape {w_exact.shape}"
+                    )
                 except FileNotFoundError:
                     print("No w_learn file found - using computed matrix")
 
@@ -896,7 +900,7 @@ class Echeveste2020(SKNMSIMethodABC):
             # FIX: Use exact same connectivity matrix as original
             # The original code uses pre-computed w_learn matrix
             # Our build_connectivity_matrix() differs by up to 0.339
-            if hasattr(self, '_W_exact') and self._W_exact is not None:
+            if hasattr(self, "_W_exact") and self._W_exact is not None:
                 # Use the exact original matrix if loaded
                 W = self._W_exact
             else:
@@ -1011,7 +1015,7 @@ class Echeveste2020(SKNMSIMethodABC):
                 u_old[: self._N_E]
             )  # Excitatorias
             r_i = self._integrator.f.supralinear_activation(
-                u_old[self._N_E:]
+                u_old[self._N_E :]
             )  # Inhibitorias
             _ = np.concatenate([r_e, r_i])  # noqa: F841
 
@@ -1028,7 +1032,7 @@ class Echeveste2020(SKNMSIMethodABC):
             # BrainPy (Main paper, Eq. 8)
             # MEJORA: Usamos integrador BrainPy en vez de implementación manual
             # du_α/dt = (-u_α + Σ_β W_αβ r_β + h_α + η_α) / τ_α
-            u_e_old, u_i_old = u_old[: self._N_E], u_old[self._N_E:]
+            u_e_old, u_i_old = u_old[: self._N_E], u_old[self._N_E :]
             u_e_new, u_i_new = self._integrator(
                 u_e_old, u_i_old, step * dt, W, stimulus, eta_old
             )
@@ -1071,7 +1075,7 @@ class Echeveste2020(SKNMSIMethodABC):
             u_trajectory[:, : self._N_E]  # Solo neuronas excitatorias
         )
         inhibitory_activity = self._integrator.f.supralinear_activation(
-            u_trajectory[:, self._N_E:]  # Solo neuronas inhibitorias
+            u_trajectory[:, self._N_E :]  # Solo neuronas inhibitorias
         )
 
         response = {
@@ -1241,9 +1245,9 @@ class Echeveste2020(SKNMSIMethodABC):
         ):
             W_full = np.zeros((self._N, self._N))
             W_full[: self._N_E, : self._N_E] = self._W_EE
-            W_full[: self._N_E, self._N_E:] = self._W_EI
-            W_full[self._N_E:, : self._N_E] = self._W_IE
-            W_full[self._N_E:, self._N_E:] = self._W_II
+            W_full[: self._N_E, self._N_E :] = self._W_EI
+            W_full[self._N_E :, : self._N_E] = self._W_IE
+            W_full[self._N_E :, self._N_E :] = self._W_II
             return W_full
 
         # Genera orientaciones preferidas para ring topology
@@ -1271,28 +1275,28 @@ class Echeveste2020(SKNMSIMethodABC):
 
         # Bloques matriciales con signos correctos según código original
         # Original: E→E (+), E→I (-), I→E (+), I→I (-)
-        W[0: self._N_E, 0: self._N_E] = connectivity_block(
+        W[0 : self._N_E, 0 : self._N_E] = connectivity_block(
             theta_e,
             theta_e,
             params["a_EE"],
             params["d_EE"],
             sign=1,
         )
-        W[0: self._N_E, self._N_E: self._N] = connectivity_block(
+        W[0 : self._N_E, self._N_E : self._N] = connectivity_block(
             theta_e,
             theta_i,
             params["a_EI"],
             params["d_EI"],
             sign=-1,
         )
-        W[self._N_E: self._N, 0: self._N_E] = connectivity_block(
+        W[self._N_E : self._N, 0 : self._N_E] = connectivity_block(
             theta_i,
             theta_e,
             params["a_IE"],
             params["d_IE"],
             sign=1,
         )
-        W[self._N_E: self._N, self._N_E: self._N] = connectivity_block(
+        W[self._N_E : self._N, self._N_E : self._N] = connectivity_block(
             theta_i,
             theta_i,
             params["a_II"],
@@ -1601,16 +1605,17 @@ class Echeveste2020(SKNMSIMethodABC):
         )
 
         # PASO 4: Extraer orientaciones de las causas
-        cause_orientations = self._extract_cause_orientations(
+        orientation_results = self._extract_cause_orientations(
             network_activity, causal_results["cause_contrasts"]
         )
 
         # Return full results dictionary
         return {
             "num_causes": causal_results["num_causes"],
-            "cause_positions": cause_orientations,
+            "cause_positions": orientation_results["orientations"],
             "cause_contrasts": causal_results["cause_contrasts"],
-            "confidence": causal_results["confidence_scores"],
+            "contrast_confidence": causal_results["confidence_scores"],
+            "orientation_confidence": orientation_results["confidence_scores"],
             "posterior_distribution": {
                 "contrast_values": posterior_dist["contrast_values"],
                 "probabilities": posterior_dist["probabilities"],
@@ -1673,6 +1678,7 @@ class Echeveste2020(SKNMSIMethodABC):
         """
         # Load GSM data using the correct data loader
         from ..data.gsm_data_loader import GSMDataLoader
+
         gsm_loader = GSMDataLoader()
         A = gsm_loader.load_gabor_filters()  # Gabor filters (256, 50)
         C = gsm_loader.load_prior_covariance()  # Covariance matrix (50, 50)
@@ -1682,7 +1688,7 @@ class Echeveste2020(SKNMSIMethodABC):
         # The network has N_E=50 excitatory neurons representing orientations
         # We need to create a 256-dimensional observation that matches GSM
 
-        excitatory_activity = network_activity[:self._N_E]  # (50,)
+        excitatory_activity = network_activity[: self._N_E]  # (50,)
 
         # Create synthetic GSM observation from network activity
         # This maps SSN activity back to visual observation space
@@ -1716,10 +1722,14 @@ class Echeveste2020(SKNMSIMethodABC):
         s_x_2 = 100.0  # This matches original Echeveste parameters
 
         # Gamma prior parameters (from original code)
-        k_gamma = 2.0    # Shape parameter
+        k_gamma = 2.0  # Shape parameter
         theta_gamma = 0.5  # Scale parameter
 
-        dz = contrast_range[1] - contrast_range[0] if len(contrast_range) > 1 else 0.1
+        dz = (
+            contrast_range[1] - contrast_range[0]
+            if len(contrast_range) > 1
+            else 0.1
+        )
 
         for i, z in enumerate(contrast_range):
             # Likelihood: P(x|z) ~ N(0, z^2 * A*C*A^T + s_x^2 * I)
@@ -1729,12 +1739,14 @@ class Echeveste2020(SKNMSIMethodABC):
                 # Log prior: P(z) ~ Gamma(k, theta)
                 if z > 0:
                     from scipy.stats import gamma
+
                     log_prior = gamma.logpdf(z, k_gamma, scale=theta_gamma)
                 else:
                     log_prior = -np.inf  # Zero prior for negative contrasts
 
                 # Log likelihood: P(x|z) ~ N(0, Cov)
                 from scipy.stats import multivariate_normal
+
                 log_likelihood = multivariate_normal.logpdf(
                     x_observation, mean_x, covariance
                 )
@@ -1771,12 +1783,12 @@ class Echeveste2020(SKNMSIMethodABC):
         """Alias for compatibility with debug functions."""
         from scipy.signal import find_peaks
 
-        peak_threshold = kwargs.get('peak_threshold', 0.1)
-        peak_distance = kwargs.get('peak_distance', 10)
+        peak_threshold = kwargs.get("peak_threshold", 0.1)
+        peak_distance = kwargs.get("peak_distance", 10)
 
-        peaks, _ = find_peaks(probabilities,
-                             height=peak_threshold,
-                             distance=peak_distance)
+        peaks, _ = find_peaks(
+            probabilities, height=peak_threshold, distance=peak_distance
+        )
         return peaks
 
     def _detect_posterior_peaks(
@@ -1822,7 +1834,9 @@ class Echeveste2020(SKNMSIMethodABC):
         # CRITICAL FIX: Exclude zero contrast from peak detection
         # Zero contrast is not a meaningful "cause" - we need to find peaks
         # in the positive contrast range that represent actual visual stimuli
-        non_zero_mask = contrast_values > 0.001  # Small threshold to avoid numerical issues
+        non_zero_mask = (
+            contrast_values > 0.001
+        )  # Small threshold to avoid numerical issues
         non_zero_indices = np.where(non_zero_mask)[0]
 
         if len(non_zero_indices) == 0:
@@ -1842,7 +1856,11 @@ class Echeveste2020(SKNMSIMethodABC):
             )
 
             # Convert relative indices back to absolute indices
-            peaks = non_zero_indices[peaks_relative] if len(peaks_relative) > 0 else np.array([], dtype=int)
+            peaks = (
+                non_zero_indices[peaks_relative]
+                if len(peaks_relative) > 0
+                else np.array([], dtype=int)
+            )
 
         # Extraer información específica de cada pico detectado
         # Las alturas representan la probabilidad posterior de cada causa
@@ -1931,7 +1949,9 @@ class Echeveste2020(SKNMSIMethodABC):
 
         if np.any(non_zero_mask):
             non_zero_probs = probabilities[non_zero_mask]
-            max_prob_non_zero = np.max(non_zero_probs) if len(non_zero_probs) > 0 else 1.0
+            max_prob_non_zero = (
+                np.max(non_zero_probs) if len(non_zero_probs) > 0 else 1.0
+            )
         else:
             max_prob_non_zero = 1.0  # Fallback
 
@@ -1968,7 +1988,13 @@ class Echeveste2020(SKNMSIMethodABC):
 
     def _extract_cause_orientations(self, network_activity, cause_contrasts):
         """
-        Extract orientation angles of causes from network activity patterns.
+        Extract orientation angles of causes from spatial activity patterns.
+
+        IMPORTANT: This implements proper orientation extraction based on
+        spatial peaks in excitatory activity, not weighted by contrast.
+
+        The number of detected causes should match the number of spatial
+        peaks in the excitatory activity pattern.
 
         Parameters
         ----------
@@ -1979,41 +2005,119 @@ class Echeveste2020(SKNMSIMethodABC):
 
         Returns
         -------
-        cause_orientations : list
-            Orientation angles in degrees for each cause
+        dict
+            Dictionary containing:
+            - 'orientations': list of orientation angles in degrees for each cause
+            - 'confidence_scores': list of confidence scores for each orientation
         """
+        from scipy.signal import find_peaks
+
         # Extraer actividad excitatoria (sintonizada a orientación)
         # Fundamento teórico: Echeveste et al. Sec. 2.1 - solo las neuronas
         # excitatorias representan las variables latentes del modelo GSM
-        # Las neuronas E están organizadas según su orientación preferida
         excitatory_activity = network_activity[: self._N_E]
 
         # Calcular orientaciones preferidas para neuronas excitatorias
-        # Fundamento: topología de anillo con neuronas organizadas
-        # Echeveste et al. Fig. 1c - "ring topology with neurons arranged
-        # according to their preferred orientation"
+        # Fundamento: topología de anillo con neuronas organizadas según
+        # su orientación preferida (ring topology)
         orientation_range = np.linspace(
             self._position_range[0], self._position_range[1], self._N_E
         )
 
-        cause_orientations = []
+        # CORRECT APPROACH: Find spatial peaks in excitatory activity
+        # Each peak corresponds to a different oriented stimulus/cause
+        # The HEIGHT of peaks relates to contrast, the POSITION to orientation
 
-        # Para cada causa detectada, extraer su orientación dominante
-        # Fundamento: Echeveste et al. Fig. 5 - cada causa tiene una orient
-        # específica determinada por el patrón de actividad de la red
-        for contrast in cause_contrasts:
-            # Encontrar neuronas con mayor actividad (orientación detectada)
-            # Ponderar actividad por intensidad del contraste de la causa
-            # Fundamento teórico: la actividad ponderada refleja la
-            # contribución relativa de cada orientación a la causa inferida
-            weighted_activity = excitatory_activity * contrast
+        # Find peaks in spatial activity pattern
+        # Use relatively permissive parameters to detect multiple causes
+        min_peak_height = 0.1 * np.max(excitatory_activity)
+        min_peak_distance = max(
+            1, self._N_E // 10
+        )  # At least N_E/10 neurons apart
 
-            # Encontrar pico en actividad (orientación dominante)
-            # El pico indica la orientación más probable para esta causa
-            # según la actividad actual de la red SSN
-            peak_neuron = np.argmax(weighted_activity)
-            peak_orientation = orientation_range[peak_neuron]
+        peaks, properties = find_peaks(
+            excitatory_activity,
+            height=min_peak_height,
+            distance=min_peak_distance,
+        )
 
-            cause_orientations.append(peak_orientation)
+        # Extract orientations from peak positions
+        peak_orientations = [orientation_range[peak] for peak in peaks]
 
-        return cause_orientations
+        # Handle mismatch between detected contrasts and spatial peaks
+        num_contrasts = len(cause_contrasts)
+        num_spatial_peaks = len(peak_orientations)
+
+        if num_spatial_peaks == 0:
+            # Fallback: use global maximum if no peaks found
+            global_peak = np.argmax(excitatory_activity)
+            global_strength = excitatory_activity[global_peak]
+            return {
+                "orientations": [orientation_range[global_peak]]
+                * num_contrasts,
+                "confidence_scores": [1.0]
+                * num_contrasts,  # Full confidence for single peak
+            }
+
+        elif num_spatial_peaks == num_contrasts:
+            # Perfect match: each contrast gets one orientation
+            peak_strengths = excitatory_activity[peaks]
+            max_strength = np.max(peak_strengths)
+            confidence_scores = (
+                peak_strengths / max_strength
+                if max_strength > 0
+                else np.ones_like(peak_strengths)
+            )
+            return {
+                "orientations": peak_orientations,
+                "confidence_scores": confidence_scores.tolist(),
+            }
+
+        elif num_spatial_peaks < num_contrasts:
+            # More contrasts than spatial peaks: some causes share orientations
+            peak_strengths = excitatory_activity[peaks]
+            max_strength = np.max(peak_strengths)
+            confidence_scores = (
+                peak_strengths / max_strength
+                if max_strength > 0
+                else np.ones_like(peak_strengths)
+            )
+
+            # Replicate orientations and confidences to match number of contrasts
+            repeated_orientations = []
+            repeated_confidences = []
+            for i in range(num_contrasts):
+                idx = i % num_spatial_peaks
+                repeated_orientations.append(peak_orientations[idx])
+                repeated_confidences.append(confidence_scores[idx])
+
+            return {
+                "orientations": repeated_orientations,
+                "confidence_scores": repeated_confidences,
+            }
+
+        else:
+            # More spatial peaks than contrasts: select strongest peaks
+            # Sort peaks by activity strength and take top N
+            peak_strengths = excitatory_activity[peaks]
+            strongest_indices = np.argsort(peak_strengths)[-num_contrasts:]
+            strongest_peaks = peaks[strongest_indices]
+            strongest_strengths = peak_strengths[strongest_indices]
+
+            # Calculate confidence scores for selected peaks
+            max_strength = np.max(strongest_strengths)
+            confidence_scores = (
+                strongest_strengths / max_strength
+                if max_strength > 0
+                else np.ones_like(strongest_strengths)
+            )
+
+            # Sort by strength (strongest first) for consistent ordering
+            sort_order = np.argsort(strongest_strengths)[::-1]
+
+            return {
+                "orientations": [
+                    orientation_range[strongest_peaks[i]] for i in sort_order
+                ],
+                "confidence_scores": confidence_scores[sort_order].tolist(),
+            }
