@@ -100,6 +100,20 @@ class EchevesteDataLoader:
         """
         return np.loadtxt(self.data_path / "sigma_eta_learn")
 
+    def load_exact_connectivity_matrix(self):
+        """
+        Load the exact connectivity matrix from the original Echeveste code.
+
+        This is the pre-computed w_learn matrix that avoids numerical
+        differences that can cause instability in the SSN dynamics.
+
+        Returns
+        -------
+        W_exact : np.ndarray, shape (100, 100)
+            Exact connectivity matrix from original Echeveste2020 code
+        """
+        return np.loadtxt(self.data_path / "w_learn")
+
     # Convenience Methods
     def load_all_gsm_data(self):
         """
