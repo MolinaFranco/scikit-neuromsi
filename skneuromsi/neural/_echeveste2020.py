@@ -31,15 +31,19 @@ class SSNIntegrator:
     - Función matemática pura que define las ecuaciones diferenciales
     - NO guarda estado, solo calcula derivadas
     - Fórmula que calcula cómo cambian las cosas por unidad de tiempo
+
+    IMPORTANT: All time constants must be in SECONDS to match BrainPy's dt.
+    The original Echeveste code uses: tau_e = 20.0e-3 s, tau_i = 10.0e-3 s
     """
 
-    #: Time constants for excitatory and inhibitory neurons
-    #: t_e: 20ms, t_i: 10ms from Echeveste et al. (2020) Supplementary Material
+    #: Time constants for excitatory and inhibitory neurons IN SECONDS
+    #: tau_e: 0.02s (20ms), tau_i: 0.01s (10ms)
+    #: From Echeveste et al. (2020) Supplementary Material Table S1
     tau_e: float
     tau_i: float
 
-    #: Time constant for correlated noise η
-    #: tau_n: 20ms by Echeveste original implementation
+    #: Time constant for correlated noise η IN SECONDS
+    #: tau_n: 0.02s (20ms) by Echeveste original implementation
     tau_n: float
 
     #: Supralinear exponent for Excitatory neurons, n=2.0
@@ -211,10 +215,14 @@ class Echeveste2020(SKNMSIMethodABC):
         {"target": "noise_level", "template": "noise_level"},
     ]
     _run_output = [
-        {"target": "excitatory", "template": "excitatory"},
-        {"target": "inhibitory", "template": "inhibitory"},
+        {"target": "excitatory_firing_rate",
+         "template": "excitatory_firing_rate"},
+        {"target": "inhibitory_firing_rate",
+         "template": "inhibitory_firing_rate"},
+        {"target": "excitatory_potential", "template": "excitatory_potential"},
+        {"target": "inhibitory_potential", "template": "inhibitory_potential"},
     ]
-    _output_mode = "excitatory"  # Primary output mode
+    _output_mode = "excitatory_firing_rate"  # Primary output mode
 
     # (Supp. Table S1)
     def __init__(
@@ -222,9 +230,9 @@ class Echeveste2020(SKNMSIMethodABC):
         *,
         N_E=50,  # Número de neuronas excitatorias
         N_I=50,  # Número de neuronas inhibitorias
-        tau_e=20.0,  # ms - Constante de tiempo excitatorias
-        tau_i=10.0,  # ms - Constante de tiempo inhibitorias
-        tau_n=20.0,  # ms - Timescale ruido correlacionado η
+        tau_e=20.0,  # ms - Excitatory time constant (→ s internally)
+        tau_i=10.0,  # ms - Inhibitory time constant (→ s internally)
+        tau_n=20.0,  # ms - Noise timescale η (→ s internally)
         n=2.0,  # Exponente supralineal de Eq. 9
         k=0.3,  # Factor de escala de Eq. 9
         seed=None,  # Semilla para generador aleatorio
@@ -314,11 +322,13 @@ class Echeveste2020(SKNMSIMethodABC):
         integrator_kws.pop("random_seed", None)
 
         # Inicializa integrador SSN con parámetros optimizados (Supp. Table S1)
-        # CRITICAL FIX: SSNIntegrator expects time constants in ms, not seconds
+        # CRITICAL: Convert time constants from ms to seconds for consistency
+        # BrainPy uses dt in seconds, so tau must also be in seconds
+        # Original code: tau_e = 20.0e-3 s, tau_i = 10.0e-3 s, dt = 0.2e-3 s
         integrator_model = SSNIntegrator(
-            tau_e=tau_e,  # Already in ms (20.0ms)
-            tau_i=tau_i,  # Already in ms (10.0ms)
-            tau_n=tau_n,  # Already in ms (20.0ms)
+            tau_e=tau_e / 1000.0,  # Convert ms to seconds: 20ms → 0.02s
+            tau_i=tau_i / 1000.0,  # Convert ms to seconds: 10ms → 0.01s
+            tau_n=tau_n / 1000.0,  # Convert ms to seconds: 20ms → 0.02s
             n=n,  # Exponente supralineal n = 2.0 (Eq. 9)
             k=k,  # Factor de escala k = 0.3 (Eq. 9)
         )
@@ -1574,7 +1584,7 @@ class Echeveste2020(SKNMSIMethodABC):
         dt = self._time_res / 1000.0  # Convierte ms a segundos
         tau_n_inv = (
             1.0 / self._integrator.f.tau_n
-        )  # τ_η^(-1), con τ_η = 20ms (Table S1)
+        )  # τ_η^(-1), con τ_η = 0.02s (20ms, Table S1)
 
         # Coeficientes para actualización temporal
         # (código original methods.py:402-403)
@@ -1666,7 +1676,7 @@ class Echeveste2020(SKNMSIMethodABC):
                     f"noise_level or stimulus_contrast."
                 )
 
-        # EXTRACCIÓN DE ACTIVIDAD NEURONAL
+        # EXTRACCIÓN DE ACTIVIDAD NEURONAL Y POTENCIALES DE MEMBRANA
         # Calcular actividad r_α(t) = k * [u_α(t)]_+^n (Main paper Eq. 9)
         excitatory_activity = self._integrator.f.supralinear_activation(
             u_trajectory[:, :self._N_E]  # Solo neuronas excitatorias
@@ -1675,11 +1685,17 @@ class Echeveste2020(SKNMSIMethodABC):
             u_trajectory[:, self._N_E:]  # Solo neuronas inhibitorias
         )
 
+        # Extraer potenciales de membrana u_α(t) (Main paper Eq. 8)
+        excitatory_potential = u_trajectory[:, :self._N_E]
+        inhibitory_potential = u_trajectory[:, self._N_E:]
+
         response = {
-            # Actividad excitatorias (Main paper Fig. 4)
-            "excitatory": excitatory_activity,
-            # Actividad inhibitorias (Main paper Fig. 4)
-            "inhibitory": inhibitory_activity,
+            # Firing rates r_α(t) (Main paper Eq. 9: r = k * [u]_+^n)
+            "excitatory_firing_rate": excitatory_activity,
+            "inhibitory_firing_rate": inhibitory_activity,
+            # Potenciales de membrana u_α(t) (Main paper Eq. 8)
+            "excitatory_potential": excitatory_potential,
+            "inhibitory_potential": inhibitory_potential,
         }
 
         # Note: temporal dimension adjustment for truncated simulations
@@ -2146,10 +2162,11 @@ class Echeveste2020(SKNMSIMethodABC):
         if network_activity is None:
             # Try to extract network activity from kwargs
             # (when called by parent class)
-            if "excitatory" in kwargs and "inhibitory" in kwargs:
+            if ("excitatory_firing_rate" in kwargs and
+                    "inhibitory_firing_rate" in kwargs):
                 # Extract final timestep from simulation results
-                exc_activity = kwargs["excitatory"]
-                inh_activity = kwargs["inhibitory"]
+                exc_activity = kwargs["excitatory_firing_rate"]
+                inh_activity = kwargs["inhibitory_firing_rate"]
 
                 # Use the final timestep as steady-state activity
                 if exc_activity.ndim > 1:
