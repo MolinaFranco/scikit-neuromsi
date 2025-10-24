@@ -1725,14 +1725,17 @@ class Echeveste2020(SKNMSIMethodABC):
         """
         from ..core.ndresult import NDResult
 
-        # Handle explosion cases by removing problematic last data point
-        if isinstance(extra, dict) and not extra.get(
-            "simulation_successful", True
-        ):
-            # For exploded simulations, always remove the last data point
-            # This fixes the systematic off-by-one issue
-            if hasattr(modes_dict, "values") and modes_dict:
-                print("DEBUG: Explosion detected - removing last point")
+        # ALWAYS adjust time_range based on actual data length
+        # The time_range parameter comes from self._time_range which is fixed
+        # but the actual simulation may be shorter (simulation_time parameter)
+        if hasattr(modes_dict, "values") and modes_dict:
+            actual_length = len(next(iter(modes_dict.values())))
+
+            # Handle explosion cases by removing problematic last data point
+            if isinstance(extra, dict) and not extra.get(
+                "simulation_successful", True
+            ):
+                # For exploded simulations, remove the last data point
                 truncated_modes_dict = {}
                 for key, data in modes_dict.items():
                     if hasattr(data, "__len__") and len(data) > 0:
@@ -1740,16 +1743,15 @@ class Echeveste2020(SKNMSIMethodABC):
                     else:
                         truncated_modes_dict[key] = data
                 modes_dict = truncated_modes_dict
+                actual_length = len(next(iter(modes_dict.values())))
 
-                # Fix floating point precision issue in time_range calculation
-                # The validation uses: expected = int(time_span/time_res)
-                # To ensure int(time_span / time_res) == new_length,
-                # we add a small epsilon to compensate
-                # for floating point errors
-                new_length = len(next(iter(modes_dict.values())))
-                epsilon = 1e-10
-                new_time_max = new_length * time_res + epsilon
-                time_range = (0, new_time_max)
+            # Fix floating point precision issue in time_range calculation
+            # The validation uses: expected = int(time_span/time_res)
+            # To ensure int(time_span / time_res) == actual_length,
+            # we calculate time_max directly from actual data length
+            epsilon = 1e-10
+            new_time_max = actual_length * time_res + epsilon
+            time_range = (0, new_time_max)
 
         # Use standard creation (validation should pass now)
         return NDResult.from_modes_dict(
