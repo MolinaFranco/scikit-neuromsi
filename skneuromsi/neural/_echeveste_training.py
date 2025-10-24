@@ -1,0 +1,1232 @@
+"""
+JAX-based training utilities for Echeveste2020 SSN model.
+
+Este módulo implementa el método de Assumed Density Filtering (ADF)
+y las funciones de costo para entrenar la Stabilized Supralinear Network
+siguiendo Echeveste et al. (2020).
+
+------------------------
+PAPER PRINCIPAL: Echeveste et al. (2020) Nature Neuroscience
+
+1. Modelo SSN (Ecuación 8 del paper):
+   τ_α · du_α/dt = -u_α + Σ_β W_αβ r_β(u_β) + h_α + η_α
+   donde:
+   - u_α: potencial de membrana de neurona α
+   - r_α = k[u_α]₊² : activación supralineal (Eq. 9)
+   - W_αβ: matriz de conectividad
+   - h_α: input externo (del GSM)
+   - η_α: ruido con covarianza Σ_η (Eq. 11)
+
+2. ADF (Assumed Density Filtering) - Ecuaciones 17-20:
+   En lugar de simular con ruido, evolucionamos los MOMENTOS:
+   - μ: vector de medias E[u_α]
+   - Σ: matriz de covarianza Cov[u_α, u_β]
+
+   Esto permite entrenar determinísticamente sin sampleo.
+
+3. Función de Costo (Ecuación 25):
+   L = λ_μ·||μ_SSN - μ_GSM||² + λ_σ·||var_SSN - var_GSM||²
+       + λ_Σ·||Σ_SSN - Σ_GSM||²_F + λ_slow·slowness
+
+   El SSN aprende a replicar las estadísticas del posterior GSM.
+
+CÓDIGO ORIGINAL: ssn_inference_optimizer/objective.ml
+- Lines 254-268: Nonlinear moments (nu, gamma)
+- Lines 314-332: ADF evolution equations
+- Lines 377-408: Cost function computation
+- Lines 153-180: Parameter packing/unpacking
+
+Referencias:
+-----------
+Echeveste, R., Aitchison, L., Hennequin, G., & Lengyel, M. (2020).
+Cortical-like dynamics in recurrent circuits optimized for
+sampling-based probabilistic inference. Nature Neuroscience, 23(9), 1138-1149.
+
+Código original OCaml:
+ssn_inference_optimizer/objective.ml
+ssn_inference_optimizer/train.ml
+"""
+
+import jax
+import jax.numpy as jnp
+from jax.scipy import stats as jax_stats
+
+
+# =============================================================================
+# Nonlinear moment functions
+# =============================================================================
+
+@jax.jit
+def compute_nonlinear_moments(mu, sigma, k=0.3):
+    """
+    Compute nonlinear moments for supralinear activation.
+
+    JUSTIFICACIÓN MATEMÁTICA
+    -------------------------
+    Paper Eq. 9: r_α = k · [u_α]₊^n donde n=2 (supralinear cuadrática)
+
+    Problema: Para ADF necesitamos E[r_α] y ∂E[r_α]/∂μ_α, pero r es NO LINEAL.
+
+    Solución (Supplementary Material, Eqs. S15-S17):
+    Si u_α ~ N(μ_α, σ_α²), entonces usando integración gaussiana:
+
+    1. E[[u]₊] = μ·Ψ(μ/σ) + σ·φ(μ/σ)  [rectificación lineal]
+       donde φ = PDF gaussiana, Ψ = CDF gaussiana
+
+    2. Para n=2 (cuadrática):
+       E[[u]₊²] = μ·E[[u]₊] + σ²·Ψ(μ/σ)
+
+    3. Por lo tanto:
+       ν = E[r] = k · E[[u]₊²] = k·(μ·nu1 + σ²·Ψ)
+       donde nu1 = E[[u]₊]
+
+    4. Para ADF también necesitamos γ = ∂E[r]/∂μ:
+       γ = ∂ν/∂μ = k · ∂E[[u]₊²]/∂μ = 2k · nu1
+
+    CÓDIGO ORIGINAL: objective.ml lines 254-268
+    - Line 261: nu1 = mu * psi + sigma * phi
+    - Line 266: nu_fun = k * (mu * nu1 + sigma² * psi)
+    - Line 267: gamma_fun = 2k * nu1
+
+    Parameters
+    ----------
+    mu : jax.Array
+        Mean vector of neuron inputs E[u_α], shape (n,)
+    sigma : jax.Array
+        Covariance matrix Cov[u_α, u_β], shape (n, n)
+    k : float
+        Scaling constant (Suppl. Table S1: k=0.3)
+
+    Returns
+    -------
+    nu : jax.Array
+        ν = E[r_α] = primer momento no lineal, shape (n,)
+    gamma : jax.Array
+        γ = ∂E[r_α]/∂μ_α = derivada del momento, shape (n,)
+
+    Notes
+    -----
+    Estos momentos son CRÍTICOS para ADF porque permiten
+    evolucionar las estadísticas de la activación NO LINEAL
+    usando solo los momentos gaussianos (μ, Σ).
+
+    Sin esto, tendríamos que hacer sampling estocástico
+    (mucho más lento y ruidoso para optimización).
+    """
+    # PASO 1: Extraer varianzas individuales σ_α²
+    # Para cada neurona α, necesitamos su varianza individual (diagonal de Σ)
+    sigma2 = jnp.diag(sigma)  # σ_α² para cada α
+    sigma_std = jnp.sqrt(sigma2)  # σ_α = sqrt(σ_α²)
+
+    # PASO 2: Calcular ratio μ/σ (argumento de las funciones gaussianas)
+    # Manejo especial para evitar división por cero cuando σ ≈ 0
+    # Si σ muy pequeño → neurona casi determinística → usar ratio = 0
+    ratio = jnp.where(
+        sigma_std > 1e-10,  # Si σ > threshold
+        mu / sigma_std,      # ratio normal
+        0.0                  # Si σ ≈ 0, usar 0 (límite cuando σ→0)
+    )
+
+    # PASO 3: Evaluar funciones gaussianas estándar
+    # φ(x) = (1/√(2π)) · exp(-x²/2) [PDF gaussiana estándar]
+    # Ψ(x) = ∫_{-∞}^x φ(t)dt [CDF gaussiana estándar]
+    phi = jax_stats.norm.pdf(ratio)  # φ(μ_α/σ_α) para cada α
+    psi = jax_stats.norm.cdf(ratio)  # Ψ(μ_α/σ_α) para cada α
+
+    # PASO 4: Calcular E[[u]₊] = primer momento de ReLU
+    # Fórmula (Suppl. Eq. S15): E[[u]₊] = μ·Ψ(μ/σ) + σ·φ(μ/σ)
+    # Interpretación:
+    # - μ·Ψ: contribución de la parte positiva desplazada por la media
+    # - σ·φ: contribución gaussiana en el borde (threshold en 0)
+    # objective.ml line 261
+    nu1 = mu * psi + sigma_std * phi
+
+    # PASO 5: Calcular ν = E[r] = E[k·[u]₊²] (n=2 hard-coded)
+    # Fórmula (Suppl. Eq. S17): E[[u]₊²] = μ·E[[u]₊] + σ²·Ψ(μ/σ)
+    # Luego multiplicamos por k (factor de escala del SSN)
+    # objective.ml line 266
+    nu = k * (mu * nu1 + sigma2 * psi)
+
+    # PASO 6: Calcular γ = ∂E[r]/∂μ (derivada del momento respecto a la media)
+    # Para n=2: γ = ∂(k·E[[u]₊²])/∂μ = 2k·E[[u]₊] = 2k·nu1
+    # Este término es CRUCIAL para la evolución de Σ en ADF
+    # (aparece en la matriz Jacobiana J)
+    # objective.ml line 267
+    gamma = 2.0 * k * nu1
+
+    return nu, gamma  # Retornar ambos momentos no lineales
+
+
+# =============================================================================
+# ADF moment evolution
+# =============================================================================
+
+@jax.jit
+def compute_jacobian_matrix(w, gamma, inv_taus):
+    """
+    Compute Jacobian matrix J for ADF evolution.
+
+    JUSTIFICACIÓN MATEMÁTICA
+    -------------------------
+    Paper Eq. 8: τ·du/dt = -u + W·r(u) + h + η
+
+    Para ADF, necesitamos la LINEALIZACIÓN de la dinámica alrededor de μ.
+
+    Derivando respecto a u:
+    τ·dμ/dt = -μ + W·E[r(u)] + h
+
+    El Jacobiano controla cómo pequeñas perturbaciones δu afectan la dinámica:
+    τ·d(δu)/dt = -δu + W·(∂E[r]/∂u)·δu
+
+    Dividiendo por τ:
+    d(δu)/dt = (1/τ)·(-δu + W·diag(γ)·δu)
+             = (1/τ)·(W·diag(γ) - I)·δu
+
+    Por lo tanto:
+    J = diag(1/τ)·(W·diag(γ) - I)
+
+    donde γ = ∂E[r]/∂μ es la derivada del momento no lineal (computed before).
+
+    Esta matriz J es CRÍTICA porque:
+    1. Controla la evolución de Σ (Eq. 18: dΣ/dt ∝ J·Σ + Σ·J^T)
+    2. Determina la estabilidad de la red (eigenvalues de J)
+    3. Aparece en la propagación de incertidumbre
+
+    CÓDIGO ORIGINAL: objective.ml lines 306-309
+    - Line 308: w_eff = W * diag(γ) - I
+    - Line 309: J = diag(1/τ) * w_eff
+
+    Parameters
+    ----------
+    w : jax.Array
+        Connectivity matrix W_αβ, shape (n, n)
+    gamma : jax.Array
+        Nonlinear moment derivatives γ_α = ∂E[r_α]/∂μ_α, shape (n,)
+    inv_taus : jax.Array
+        Inverse time constants 1/τ_α, shape (n,)
+
+    Returns
+    -------
+    j_mat : jax.Array
+        Jacobian matrix J, shape (n, n)
+
+    Notes
+    -----
+    La matriz efectiva W_eff = W·diag(γ) - I representa:
+    - W·diag(γ): conectividad ponderada por ganancia no lineal
+    - -I: término de leak (decay pasivo)
+
+    Luego diag(1/τ) escala todo por las constantes de tiempo.
+    """
+    # PASO 1: Construir matriz efectiva W_eff = W·diag(γ) - I
+    # Broadcasting: w * gamma[None, :] multiplica cada columna j de w por γ_j
+    # Esto equivale a W·diag(γ) en notación matricial
+    # objective.ml line 308
+    w_eff = w * gamma[None, :] - jnp.eye(w.shape[0])
+
+    # PASO 2: Escalar por constantes de tiempo J = diag(1/τ)·W_eff
+    # Broadcasting: inv_taus[:, None] multiplica cada fila i por 1/τ_i
+    # Esto equivale a multiplicación diag(1/τ)·W_eff
+    # objective.ml line 309
+    j_mat = inv_taus[:, None] * w_eff
+
+    return j_mat
+
+
+@jax.jit
+def dmu_dt(w, mu, nu, h, inv_taus):
+    """
+    Compute mean evolution dμ/dt.
+
+    JUSTIFICACIÓN MATEMÁTICA
+    -------------------------
+    Paper Eq. 8: τ_α·du_α/dt = -u_α + Σ_β W_αβ·r_β(u_β) + h_α + η_α
+
+    Tomando valor esperado E[·] en ambos lados:
+    τ_α·dE[u_α]/dt = -E[u_α] + Σ_β W_αβ·E[r_β(u_β)] + E[h_α] + E[η_α]
+
+    Como:
+    - μ_α = E[u_α] (media del potencial)
+    - ν_β = E[r_β] (media de activación, ver compute_nonlinear_moments)
+    - E[h_α] = h_α (input externo es determinístico)
+    - E[η_α] = 0 (ruido tiene media cero)
+
+    Obtenemos la ECUACIÓN 17 del paper:
+    τ_α·dμ_α/dt = -μ_α + Σ_β W_αβ·ν_β + h_α
+
+    Reescribiendo en forma vectorial:
+    τ·dμ/dt = -μ + W·ν + h
+
+    Dividiendo por τ:
+    dμ/dt = (1/τ)·(-μ + W·ν + h)
+
+    Esta ecuación describe cómo evoluciona la MEDIA de los potenciales
+    bajo la aproximación ADF (sin ruido, solo momentos determinísticos).
+
+    CÓDIGO ORIGINAL: objective.ml lines 313-316
+    - Line 315: z = (h - mu) + W·ν
+    - Line 316: dμ/dt = (1/τ)·z
+
+    Parameters
+    ----------
+    w : jax.Array
+        Connectivity matrix W_αβ, shape (n, n)
+    mu : jax.Array
+        Current mean vector μ_α = E[u_α], shape (n,)
+    nu : jax.Array
+        Nonlinear moment ν_α = E[r_α], shape (n,)
+    h : jax.Array
+        External input h_α (from GSM), shape (n,)
+    inv_taus : jax.Array
+        Inverse time constants 1/τ_α, shape (n,)
+
+    Returns
+    -------
+    dmu : jax.Array
+        Time derivative dμ/dt, shape (n,)
+
+    Notes
+    -----
+    Esta función implementa la evolución DETERMINÍSTICA de la media.
+    La varianza Σ evoluciona por separado (ver new_sigma).
+
+    El término W·ν es la suma de inputs recurrentes:
+    (W·ν)_α = Σ_β W_αβ·ν_β = input recurrente a neurona α
+    """
+    # PASO 1: Calcular término combinado z = (h - μ) + W·ν
+    # Interpretación:
+    # - (h - μ): diferencia entre input externo y estado actual (driving force)
+    # - W·ν: input recurrente promedio desde otras neuronas
+    # objective.ml line 315
+    z = (h - mu) + jnp.dot(w, nu)
+
+    # PASO 2: Escalar por constante de tiempo 1/τ
+    # Esto da la tasa de cambio real considerando la dinámica temporal
+    # objective.ml line 316
+    dmu = inv_taus * z
+
+    return dmu
+
+
+@jax.jit
+def new_sigma_star(j_mat, sigma_eta, sigma_star, dt,
+                   tau_eta, inv_taus):
+    """
+    Update Σ* (auxiliary covariance for noise autocorrelation).
+
+    JUSTIFICACIÓN MATEMÁTICA
+    -------------------------
+    Paper Eq. 11: El ruido η_α(t) tiene correlación temporal:
+    E[η_α(t)·η_β(t')] = (Σ_η)_αβ · exp(-|t-t'|/τ_η)
+
+    Problema: En ADF necesitamos rastrear cómo el ruido CORRELACIONADO
+    temporalmente afecta la covarianza de los potenciales.
+
+    Solución (Paper Eq. 19 y Supplementary Material):
+    Se introduce una COVARIANZA AUXILIAR Σ* que rastrea la
+    "memoria" del ruido en la dinámica.
+
+    ECUACIÓN 19 del paper:
+    dΣ*/dt = -(1/τ_η)·Σ* + J·Σ* + diag(1/τ)·Σ_η
+
+    Esta ecuación tiene tres términos:
+    1. -(1/τ_η)·Σ*: decay de la correlación temporal del ruido
+    2. J·Σ*: propagación de la correlación a través de la dinámica
+    3. diag(1/τ)·Σ_η: inyección de nueva correlación desde el ruido
+
+    Integrando con método de Euler (discretización temporal):
+    Σ*(t+dt) ≈ Σ*(t) + dt·dΣ*/dt
+
+    El código original usa una discretización mejorada (ver objetivo.ml):
+    Σ*(t+dt) = ε₁·(Σ* + dt·J·Σ*) + ε₂·diag(1/τ)·Σ_η
+
+    donde:
+    - ε₁ = 1 - dt/τ_η (factor de decay del ruido)
+    - ε₂ = dt·(1 + dt/τ_η) (factor de inyección)
+
+    CÓDIGO ORIGINAL: objective.ml lines 318-322
+    - Lines 127-128: definición de ε₁, ε₂
+    - Line 320: tmp1 = Σ* + dt·J·Σ*
+    - Line 321: tmp2 = diag(1/τ)·Σ_η
+    - Line 322: Σ*_new = ε₁·tmp1 + ε₂·tmp2
+
+    Parameters
+    ----------
+    j_mat : jax.Array
+        Jacobian matrix J, shape (n, n)
+    sigma_eta : jax.Array
+        Noise covariance matrix Σ_η, shape (n, n)
+    sigma_star : jax.Array
+        Current auxiliary covariance Σ*, shape (n, n)
+    dt : float
+        Time step (seconds)
+    tau_eta : float
+        Noise autocorrelation time constant τ_η (seconds)
+    inv_taus : jax.Array
+        Inverse neuronal time constants 1/τ_α, shape (n,)
+
+    Returns
+    -------
+    sigma_star_new : jax.Array
+        Updated auxiliary covariance Σ*(t+dt), shape (n, n)
+
+    Notes
+    -----
+    Σ* es CRUCIAL para modelar ruido con correlación temporal.
+    Si τ_η → 0 (ruido blanco), entonces Σ* → 0 y se simplifica.
+
+    La interacción entre τ_η (timescale del ruido) y τ (timescale
+    de las neuronas) determina cuánta memoria retiene la red.
+    """
+    # PASO 1: Calcular coeficientes temporales
+    # ε₁ controla cuánto "olvida" la red (decay)
+    # ε₂ controla cuánto "recuerda" (inyección de ruido)
+    # objective.ml lines 127-128
+    eps1 = 1.0 - dt / tau_eta  # ε₁ = 1 - dt/τ_η
+    eps2 = dt * (1.0 + dt / tau_eta)  # ε₂ = dt·(1 + dt/τ_η)
+
+    # PASO 2: Propagar Σ* a través de la dinámica
+    # tmp1 = Σ* + dt·J·Σ* (Euler step con Jacobiano)
+    # J·Σ* describe cómo la dinámica de la red propaga la correlación
+    # objective.ml line 320
+    j_mat_sigma_star = jnp.dot(j_mat, sigma_star)
+    tmp1 = sigma_star + dt * j_mat_sigma_star
+
+    # PASO 3: Preparar inyección de ruido
+    # tmp2 = diag(1/τ)·Σ_η
+    # El factor 1/τ escala el ruido por las constantes de tiempo neuronales
+    # (neuronas rápidas tienen menos tiempo para acumular ruido)
+    # objective.ml line 321
+    tmp2 = inv_taus[:, None] * sigma_eta
+
+    # PASO 4: Combinar decay y inyección
+    # ε₁·tmp1: estado propagado con decay
+    # ε₂·tmp2: nueva correlación inyectada desde Σ_η
+    # objective.ml line 322
+    sigma_star_new = eps1 * tmp1 + eps2 * tmp2
+
+    return sigma_star_new
+
+
+@jax.jit
+def new_sigma(j_mat, sigma_star, sigma, dt, inv_taus):
+    """
+    Update Σ (covariance matrix).
+
+    JUSTIFICACIÓN MATEMÁTICA
+    -------------------------
+    Paper Eq. 8: τ·du/dt = -u + W·r(u) + h + η
+
+    Queremos evolucionar Σ_αβ = Cov[u_α, u_β] = E[(u_α - μ_α)·(u_β - μ_β)]
+
+    Derivando Σ_αβ respecto al tiempo y usando la dinámica de u:
+    dΣ/dt = E[(du/dt)·(u - μ)^T] + E[(u - μ)·(du/dt)^T]
+
+    Sustituyendo la ecuación de u y LINEALIZANDO alrededor de μ:
+    du/dt ≈ (1/τ)·(-u + W·E[r] + J·(u - μ) + h + η)
+
+    donde J = diag(1/τ)·(W·diag(γ) - I) es el Jacobiano.
+
+    Después de algebra (ver Supplementary Material, derivación completa):
+
+    ECUACIÓN 18 del paper:
+    dΣ/dt = J·Σ + Σ·J^T + 2·diag(1/τ)·Σ* + (términos de orden dt²)
+
+    Integrando con método de Euler mejorado (objetivo.ml):
+    Σ(t+dt) = P·Σ·P^T + B + B^T
+
+    donde:
+    - P = I + dt·J (propagador lineal de primer orden)
+    - B = dt·diag(1/τ)·Σ* + dt²·J·Σ* (término de ruido + corrección)
+
+    Interpretación física:
+    1. P·Σ·P^T: Propagación de la covarianza existente a través de la dinámica
+    2. B + B^T: Inyección simétrica de nueva varianza desde el ruido
+
+    CÓDIGO ORIGINAL: objective.ml lines 325-330
+    - Line 327-328: B = dt·diag(1/τ)·Σ* + dt²·J·Σ*
+    - Line 329: P = I + dt·J
+    - Line 330: Σ_new = P·Σ·P^T + B + B^T
+
+    Parameters
+    ----------
+    j_mat : jax.Array
+        Jacobian matrix J, shape (n, n)
+    sigma_star : jax.Array
+        Auxiliary covariance Σ* (noise memory), shape (n, n)
+    sigma : jax.Array
+        Current covariance matrix Σ, shape (n, n)
+    dt : float
+        Time step (seconds)
+    inv_taus : jax.Array
+        Inverse time constants 1/τ_α, shape (n,)
+
+    Returns
+    -------
+    sigma_new : jax.Array
+        Updated covariance matrix Σ(t+dt), shape (n, n)
+
+    Notes
+    -----
+    Esta es la ecuación MÁS CRÍTICA de ADF porque:
+    1. Captura cómo la variabilidad se propaga en el tiempo
+    2. Incluye efectos del ruido correlacionado (vía Σ*)
+    3. La simetría (B + B^T) garantiza que Σ sea simétrica
+    4. La forma P·Σ·P^T preserva positividad (si dt pequeño)
+
+    Si J es estable (eigenvalues < 0), entonces Σ converge a
+    un estado estacionario.
+    Si J tiene eigenvalues > 0, la red es inestable y Σ explota.
+    """
+    # PRE-CÓMPUTO: Calcular J·Σ* una sola vez (usado en B)
+    # Este producto matricial describe cómo la dinámica transforma
+    # la memoria del ruido
+    j_mat_sigma_star = jnp.dot(j_mat, sigma_star)
+
+    # PASO 1: Construir matriz B (inyección de varianza desde ruido)
+    # B tiene dos términos:
+    # 1. dt·diag(1/τ)·Σ*: contribución directa del ruido (orden dt)
+    # 2. dt²·J·Σ*: corrección de segundo orden por dinámica (orden dt²)
+    # objective.ml lines 327-328
+    b = dt * (inv_taus[:, None] * sigma_star)  # Término orden dt
+    b = b + (dt * dt) * j_mat_sigma_star  # Término orden dt²
+
+    # PASO 2: Construir propagador P = I + dt·J
+    # P describe cómo la linealización de la dinámica propaga perturbaciones
+    # Para dt pequeño, P ≈ exp(dt·J) (exponencial matricial aproximada)
+    # objective.ml line 329
+    prop = jnp.eye(j_mat.shape[0]) + dt * j_mat
+
+    # PASO 3: Propagar Σ y agregar ruido
+    # P·Σ·P^T: transforma Σ según la dinámica linealizada
+    # B + B^T: agrega varianza del ruido simétricamente
+    # La simetría es crítica: Cov[X,Y] = Cov[Y,X]
+    # objective.ml line 330
+    sigma_new = jnp.dot(prop, jnp.dot(sigma, prop.T))  # Propagación
+    sigma_new = sigma_new + b + b.T  # Inyección de ruido (simétrica)
+
+    return sigma_new
+
+
+@jax.jit
+def evolve_moments_single_step(
+    mu, sigma, sigma_star, w, h, sigma_eta,
+    dt, tau_eta, inv_taus, k=0.3
+):
+    """
+    Evolve moments (μ, Σ, Σ*) for a single time step using ADF.
+
+    JUSTIFICACIÓN MATEMÁTICA
+    -------------------------
+    Esta función INTEGRA todas las ecuaciones de ADF para un paso temporal.
+
+    Paper Eqs. 17-20 (sistema acoplado de ecuaciones diferenciales):
+
+    1. Eq. 17: dμ/dt = (1/τ)·(-μ + W·ν + h)
+       → Evolución de la MEDIA de los potenciales
+
+    2. Eq. 18: dΣ/dt = J·Σ + Σ·J^T + 2·diag(1/τ)·Σ*
+       → Evolución de la COVARIANZA de los potenciales
+
+    3. Eq. 19: dΣ*/dt = -(1/τ_η)·Σ* + J·Σ* + diag(1/τ)·Σ_η
+       → Evolución de la MEMORIA del ruido
+
+    donde:
+    - ν, γ son momentos no lineales de r = k·[u]₊² (Eq. 9)
+    - J = diag(1/τ)·(W·diag(γ) - I) es el Jacobiano
+
+    PIPELINE COMPUTACIONAL:
+    -----------------------
+    Para cada paso temporal t → t+dt:
+
+    1. Calcular momentos no lineales (ν, γ) dado μ, Σ actuales
+       → Necesitamos ν para dμ/dt
+       → Necesitamos γ para construir J
+
+    2. Construir Jacobiano J dado γ
+       → Necesitamos J para dΣ/dt y dΣ*/dt
+
+    3. Integrar μ usando método de Euler: μ(t+dt) = μ(t) + dt·dμ/dt
+       → Actualiza la media
+
+    4. Integrar Σ usando esquema mejorado (ver new_sigma)
+       → Actualiza la covarianza
+
+    5. Integrar Σ* usando esquema mejorado (ver new_sigma_star)
+       → Actualiza la memoria del ruido
+
+    ORDEN DE EJECUCIÓN:
+    Este orden es CRÍTICO porque:
+    - ν, γ dependen de μ, Σ del paso ANTERIOR
+    - J depende de γ del paso ANTERIOR
+    - μ_new, Σ_new, Σ*_new se calculan en PARALELO usando valores antiguos
+
+    Esto corresponde a un método de Euler EXPLÍCITO (forward Euler).
+
+    CÓDIGO ORIGINAL: objective.ml lines 349-372
+    - Lines 355-357: cálculo de ν, γ
+    - Lines 358-359: cálculo de J
+    - Line 361: actualización de μ
+    - Line 362: actualización de Σ
+    - Line 363: actualización de Σ*
+
+    Parameters
+    ----------
+    mu : jax.Array
+        Current mean vector μ(t), shape (n,)
+    sigma : jax.Array
+        Current covariance matrix Σ(t), shape (n, n)
+    sigma_star : jax.Array
+        Current auxiliary covariance Σ*(t), shape (n, n)
+    w : jax.Array
+        Connectivity matrix W (fixed), shape (n, n)
+    h : jax.Array
+        External input h (from GSM), shape (n,)
+    sigma_eta : jax.Array
+        Noise covariance Σ_η (fixed), shape (n, n)
+    dt : float
+        Time step Δt (seconds)
+    tau_eta : float
+        Noise autocorrelation time τ_η (seconds)
+    inv_taus : jax.Array
+        Inverse time constants 1/τ_α, shape (n,)
+    k : float
+        Supralinear scaling constant (default 0.3)
+
+    Returns
+    -------
+    mu_new : jax.Array
+        Updated mean μ(t+dt), shape (n,)
+    sigma_new : jax.Array
+        Updated covariance Σ(t+dt), shape (n, n)
+    sigma_star_new : jax.Array
+        Updated auxiliary covariance Σ*(t+dt), shape (n, n)
+
+    Notes
+    -----
+    Esta función es el CORAZÓN de ADF:
+    - Se llama repetidamente en un loop temporal
+    - Cada llamada avanza el sistema un paso dt
+    - La estabilidad numérica requiere dt suficientemente pequeño
+      (típicamente dt << min(τ_e, τ_i, τ_η))
+
+    El método es determinístico (no hay sampling) pero captura
+    efectos del ruido estocástico mediante Σ y Σ*.
+    """
+    # PASO 1: Calcular momentos no lineales (ν, γ) para el estado actual
+    # Estos dependen solo de (μ, Σ) del tiempo t
+    # ν = E[r] = E[k·[u]₊²] (valor esperado de la activación)
+    # γ = ∂E[r]/∂μ (sensibilidad de ν a cambios en μ)
+    nu, gamma = compute_nonlinear_moments(mu, sigma, k)
+
+    # PASO 2: Construir matriz Jacobiana J
+    # J = diag(1/τ)·(W·diag(γ) - I)
+    # Esta matriz controla la linealización de la dinámica
+    j_mat = compute_jacobian_matrix(w, gamma, inv_taus)
+
+    # PASO 3: Evolucionar media μ (Eq. 17)
+    # μ(t+dt) = μ(t) + dt·dμ/dt
+    # donde dμ/dt = (1/τ)·(-μ + W·ν + h)
+    mu_new = mu + dt * dmu_dt(w, mu, nu, h, inv_taus)
+
+    # PASO 4: Evolucionar covarianza Σ (Eq. 18)
+    # Usa esquema mejorado: Σ(t+dt) = P·Σ·P^T + B + B^T
+    # Incluye propagación de Σ y efectos del ruido vía Σ*
+    sigma_new = new_sigma(
+        j_mat, sigma_star, sigma, dt, inv_taus
+    )
+
+    # PASO 5: Evolucionar covarianza auxiliar Σ* (Eq. 19)
+    # Σ*(t+dt) = ε₁·(Σ* + dt·J·Σ*) + ε₂·diag(1/τ)·Σ_η
+    # Rastrea la memoria de la correlación temporal del ruido
+    sigma_star_new = new_sigma_star(
+        j_mat, sigma_eta, sigma_star, dt,
+        tau_eta, inv_taus
+    )
+
+    return mu_new, sigma_new, sigma_star_new
+
+
+def evolve_moments(
+    w, h, sigma_eta, inv_taus, dt, tau_eta,
+    t_max, k=0.3, mu_init=None, sigma_init=None
+):
+    """
+    Evolve moments from t=0 to t=t_max using ADF.
+
+    Evoluciona los momentos (μ, Σ) desde condiciones iniciales
+    hasta alcanzar el tiempo final t_max.
+
+    Based on objective.ml lines 348-372.
+
+    Parameters
+    ----------
+    w : jax.Array or np.ndarray
+        Connectivity matrix, shape (n, n)
+    h : jax.Array or np.ndarray
+        External input, shape (n,)
+    sigma_eta : jax.Array or np.ndarray
+        Noise covariance, shape (n, n)
+    inv_taus : jax.Array or np.ndarray
+        Inverse time constants, shape (n,)
+    dt : float
+        Time step
+    tau_eta : float
+        Noise autocorrelation time constant
+    t_max : float
+        Maximum integration time
+    k : float
+        Supralinear scaling constant
+    mu_init : jax.Array or None
+        Initial mean (if None, uses zeros)
+    sigma_init : jax.Array or None
+        Initial covariance (if None, uses 4*I)
+
+    Returns
+    -------
+    mu_final : jax.Array
+        Final mean vector, shape (n,)
+    sigma_final : jax.Array
+        Final covariance matrix, shape (n, n)
+    sigma_star_final : jax.Array
+        Final auxiliary covariance, shape (n, n)
+
+    Notes
+    -----
+    Implementa el loop temporal de objective.ml lines 351-372.
+    """
+    # Convertir a JAX arrays si es necesario
+    w = jnp.asarray(w)
+    h = jnp.asarray(h)
+    sigma_eta = jnp.asarray(sigma_eta)
+    inv_taus = jnp.asarray(inv_taus)
+
+    n = w.shape[0]
+    n_time_bins = int(t_max / dt)
+
+    # Condiciones iniciales (objective.ml lines 367-371)
+    if mu_init is None:
+        mu = jnp.zeros(n)
+    else:
+        mu = jnp.asarray(mu_init)
+
+    if sigma_init is None:
+        sigma = 4.0 * jnp.eye(n)
+    else:
+        sigma = jnp.asarray(sigma_init)
+
+    # Σ* inicial (objective.ml line 371)
+    sigma_star = 4.0 * jnp.eye(n)
+
+    # Loop temporal (objective.ml lines 351-364)
+    for t in range(n_time_bins):
+        mu, sigma, sigma_star = evolve_moments_single_step(
+            mu, sigma, sigma_star, w, h, sigma_eta,
+            dt, tau_eta, inv_taus, k
+        )
+
+    return mu, sigma, sigma_star
+
+
+# =============================================================================
+# Cost functions
+# =============================================================================
+
+@jax.jit
+def compute_cost_components(
+    mu, sigma, target_mu, target_sigma,
+    lambda_mean=1.0, lambda_var=1.0, lambda_cov=1.0
+):
+    """
+    Compute cost function components (mean, variance, covariance).
+
+    JUSTIFICACIÓN MATEMÁTICA
+    -------------------------
+    Paper Eq. 25: Función de costo para entrenar el SSN
+
+    L = λ_μ·||μ_SSN - μ_GSM||² + λ_σ²·||var_SSN - var_GSM||²
+        + λ_Σ·||Σ_SSN - Σ_GSM||²_F + λ_slow·slowness
+
+    Objetivo: El SSN debe REPLICAR las estadísticas del posterior del GSM
+
+    ¿Por qué estos tres términos?
+
+    1. MEAN MATCHING (λ_μ·||μ_SSN - μ_GSM||²):
+       - Fuerza que la actividad PROMEDIO de la red coincida con el posterior
+       - μ_GSM = E[y|x,z] es la estimación MAP del GSM
+       - El SSN debe representar esta estimación en su actividad media
+       - Norma L2 (suma de cuadrados) penaliza desviaciones grandes
+
+    2. VARIANCE MATCHING (λ_σ²·||var_SSN - var_GSM||²):
+       - Fuerza que la VARIABILIDAD INDIVIDUAL de cada neurona coincida
+       - var_α = (Σ)_αα es la varianza de la neurona α (diagonal de Σ)
+       - Importante para capturar la INCERTIDUMBRE del posterior
+       - Si GSM está seguro (var pequeña) → SSN debe tener poca variabilidad
+       - Si GSM está inseguro (var grande) → SSN debe tener alta variabilidad
+
+    3. COVARIANCE MATCHING (λ_Σ·||Σ_SSN - Σ_GSM||²_F):
+       - Fuerza que las CORRELACIONES entre neuronas coincidan
+       - ||·||_F es la norma de Frobenius: ||A||²_F = Σ_ij A²_ij
+       - Las correlaciones capturan la ESTRUCTURA del posterior
+       - Ejemplo: si orientaciones cercanas están correlacionadas en GSM,
+         neuronas cercanas en SSN también deben estarlo
+       - Este término es CRÍTICO para sampling-based inference
+
+    ¿Por qué ponderaciones λ separadas?
+    - Diferentes términos tienen diferentes escalas (μ ~ O(1), Σ ~ O(0.1))
+    - λ's permiten balancear la importancia relativa
+    - Valores típicos (Suppl. Table S1): λ_μ = 1.0, λ_σ² = 1.0, λ_Σ = 0.1
+
+    IMPLEMENTACIÓN:
+    Solo usamos neuronas EXCITATORIAS (primeras m) porque:
+    - Las neuronas inhibitorias son "hidden" (no observables)
+    - El GSM solo tiene targets para orientaciones (E neurons)
+    - Las I neurons se ajustan implícitamente vía conectividad
+
+    CÓDIGO ORIGINAL: objective.ml lines 395-398
+    - Line 395: cost_mean = λ_μ·Σ_α(μ_target - μ)²
+    - Line 396: cost_var = λ_σ²·Σ_α(var_target - var)²
+    - Lines 397-398: cost_cov = λ_Σ·Σ_αβ(Σ_target - Σ)²_αβ
+
+    Parameters
+    ----------
+    mu : jax.Array
+        Network mean (excitatory neurons only), shape (m,)
+    sigma : jax.Array
+        Network covariance (excitatory neurons only), shape (m, m)
+    target_mu : jax.Array
+        Target mean from GSM posterior E[y|x,z], shape (m,)
+    target_sigma : jax.Array
+        Target covariance from GSM posterior Cov[y|x,z], shape (m, m)
+    lambda_mean : float
+        Weight λ_μ for mean matching term
+    lambda_var : float
+        Weight λ_σ² for variance matching term
+    lambda_cov : float
+        Weight λ_Σ for covariance matching term
+
+    Returns
+    -------
+    cost_mean : float
+        Mean matching cost λ_μ·||μ - μ_target||²
+    cost_var : float
+        Variance matching cost λ_σ²·||var - var_target||²
+    cost_cov : float
+        Covariance matching cost λ_Σ·||Σ - Σ_target||²_F
+
+    Notes
+    -----
+    Minimizar estos tres términos simultáneamente hace que
+    el SSN aprenda a:
+    1. Estimar correctamente (mean matching)
+    2. Representar incertidumbre (variance matching)
+    3. Capturar estructura (covariance matching)
+
+    Esto permite sampling-based probabilistic inference:
+    la red genera samples ~ P(y|x,z) mediante ruido interno.
+    """
+    # PASO 1: Mean matching - diferencia en medias
+    # ||μ_target - μ||² = Σ_α (μ_target,α - μ_α)²
+    # Penaliza que la actividad promedio no coincida con el posterior
+    # objective.ml line 395
+    cost_mean = lambda_mean * jnp.sum((target_mu - mu) ** 2)
+
+    # PASO 2: Variance matching - diferencia en varianzas individuales
+    # Extraemos solo la diagonal de Σ (varianzas individuales)
+    # ||var_target - var||² = Σ_α (Σ_target,αα - Σ_αα)²
+    # Penaliza que la variabilidad individual no coincida
+    # objective.ml line 396
+    cost_var = lambda_var * jnp.sum(
+        (jnp.diag(target_sigma) - jnp.diag(sigma)) ** 2
+    )
+
+    # PASO 3: Covariance matching - diferencia en toda la matriz
+    # Norma de Frobenius: ||A||²_F = Σ_αβ A²_αβ
+    # jnp.sum(A**2) calcula Σ_ij A²_ij (equivalente a ||A||²_F)
+    # Penaliza que las correlaciones no coincidan
+    # objective.ml lines 397-398
+    cost_cov = lambda_cov * jnp.sum((target_sigma - sigma) ** 2)
+
+    return cost_mean, cost_var, cost_cov
+
+
+def compute_evolution_costs(
+    w, h, sigma_eta, inv_taus, dt, tau_eta, t_max, t_subsamp,
+    target_mu, target_sigma, k=0.3,
+    lambda_mean=1.0, lambda_var=1.0, lambda_cov=1.0,
+    min_time=0.05
+):
+    """
+    Compute cost over entire time evolution using ADF.
+
+    JUSTIFICACIÓN MATEMÁTICA
+    -------------------------
+    Esta es la FUNCIÓN DE COSTO COMPLETA que se optimiza durante
+    el entrenamiento.
+
+    Concepto: No solo queremos que el SSN coincida con el GSM en el estado
+    FINAL, sino durante todo el período de "lectura" (min_time hasta t_max).
+
+    ¿Por qué integrar en el tiempo?
+
+    1. ESTABILIDAD: Asegura que la red no solo llega al target, sino que
+       se mantiene estable cerca de él durante un período de tiempo.
+
+    2. SAMPLING: Para probabilistic inference, la red debe generar samples
+       durante un período de tiempo. Queremos que TODO ese período refleje
+       el posterior correcto, no solo el estado final.
+
+    3. DINÁMICA REALISTA: Las redes neuronales biológicas tienen dinámica
+       transitoria. Queremos capturar el comportamiento realista después
+       de que la red se "asienta" (después de min_time).
+
+    ALGORITMO:
+    -----------
+    1. Inicializar μ = 0, Σ = 4I, Σ* = 4I (condiciones iniciales)
+       → Valores de objective.ml lines 404-407
+       → 4I da varianza inicial moderada (ni muy pequeña ni muy grande)
+
+    2. Loop temporal desde t=0 hasta t=t_max:
+       a. Evolucionar (μ, Σ, Σ*) un paso dt usando ADF (Eqs. 17-19)
+       b. Si t >= (t_max - min_time) y t es múltiplo de t_subsamp:
+          - Extraer solo neuronas excitatorias (primeras m)
+          - Calcular costo comparando con targets del GSM
+          - Acumular costo
+
+    3. Retornar costo total acumulado
+
+    ¿Por qué min_time?
+    - La red necesita tiempo para "asentarse" (transiente inicial)
+    - Solo evaluamos costo en los últimos min_time segundos
+    - Típicamente min_time = 50ms (suficiente para estabilización)
+
+    ¿Por qué t_subsamp?
+    - No necesitamos evaluar costo en CADA paso temporal
+    - Subsampling reduce costo computacional
+    - Típicamente t_subsamp = 5ms (cada 5ms evaluamos costo)
+
+    GRADIENTES:
+    JAX calculará automáticamente ∂L/∂W usando diferenciación automática
+    a través de TODO este loop temporal (backpropagation through time).
+
+    CÓDIGO ORIGINAL: objective.ml lines 377-408
+    - Lines 379-391: loop temporal con evolución de momentos
+    - Lines 393-400: acumulación de costo (solo después de min_time)
+    - Lines 404-407: condiciones iniciales
+
+    Parameters
+    ----------
+    w : jax.Array or np.ndarray
+        Connectivity matrix W, shape (n, n) where n = N_E + N_I
+    h : jax.Array or np.ndarray
+        External input h (from GSM), shape (n,)
+    sigma_eta : jax.Array or np.ndarray
+        Noise covariance Σ_η, shape (n, n)
+    inv_taus : jax.Array or np.ndarray
+        Inverse time constants 1/τ_α, shape (n,)
+    dt : float
+        Time step Δt (seconds, típicamente 0.0005s = 0.5ms)
+    tau_eta : float
+        Noise autocorrelation time τ_η (seconds, típicamente 0.01s = 10ms)
+    t_max : float
+        Maximum integration time (seconds, típicamente 0.1s = 100ms)
+    t_subsamp : float
+        Cost evaluation interval (seconds, típicamente 0.005s = 5ms)
+    target_mu : np.ndarray
+        Target mean μ_GSM from posterior, shape (m,) where m = N_E
+    target_sigma : np.ndarray
+        Target covariance Σ_GSM from posterior, shape (m, m)
+    k : float
+        Supralinear scaling constant (default 0.3)
+    lambda_mean : float
+        Weight λ_μ for mean matching (default 1.0)
+    lambda_var : float
+        Weight λ_σ² for variance matching (default 1.0)
+    lambda_cov : float
+        Weight λ_Σ for covariance matching (default 1.0)
+    min_time : float
+        Evaluation window at end (seconds, default 0.05s = 50ms)
+
+    Returns
+    -------
+    total_cost : float
+        Total accumulated cost L = Σ_t [mean_cost + var_cost + cov_cost]
+    mu_final : jax.Array
+        Final mean state μ(t_max), shape (n,)
+    sigma_final : jax.Array
+        Final covariance state Σ(t_max), shape (n, n)
+
+    Notes
+    -----
+    Esta función es DIFERENCIABLE por JAX:
+    - grad_w = jax.grad(lambda w: compute_evolution_costs(w, ...)[0])
+    - Calcula ∂L/∂W automáticamente vía backprop through time
+    - Esto es CRÍTICO para L-BFGS-B optimization
+
+    El costo total puede ser muy grande (suma sobre muchos timesteps),
+    pero L-BFGS-B se encarga de escalar los gradientes apropiadamente.
+
+    Solo usamos neuronas E para el costo porque:
+    - GSM solo provee targets para orientaciones (E neurons)
+    - I neurons se optimizan implícitamente vía balance E/I
+    """
+    # PASO 0: Convertir todos los inputs a JAX arrays
+    # JAX necesita arrays propios para diferenciación automática
+    # numpy arrays no son diferenciables
+    w = jnp.asarray(w)
+    h = jnp.asarray(h)
+    sigma_eta = jnp.asarray(sigma_eta)
+    inv_taus = jnp.asarray(inv_taus)
+    target_mu = jnp.asarray(target_mu)
+    target_sigma = jnp.asarray(target_sigma)
+
+    # PASO 1: Calcular parámetros temporales
+    n = w.shape[0]  # n = N_E + N_I (total neuronas)
+    m = n // 2  # m = N_E (solo excitatorias, asumiendo N_E = N_I)
+    n_time_bins = int(t_max / dt)  # Número total de pasos temporales
+    subsamp_bins = int(t_subsamp / dt)  # Intervalo entre evaluaciones
+    min_time_bins = int(min_time / dt)  # Bins en ventana evaluación
+
+    # PASO 2: Condiciones iniciales de los momentos
+    # Valores estándar del código original (objective.ml lines 404-407)
+    # μ(0) = 0: red comienza en reposo (sin actividad)
+    # Σ(0) = 4I: varianza inicial moderada (ni determinística ni muy ruidosa)
+    # Σ*(0) = 4I: memoria inicial del ruido (mismo valor que Σ)
+    mu = jnp.zeros(n)  # Medias iniciales en cero
+    sigma = 4.0 * jnp.eye(n)  # Covarianza inicial proporcional a identidad
+    sigma_star = 4.0 * jnp.eye(n)  # Aux. covarianza inicial
+
+    # PASO 3: Inicializar acumuladores de costo
+    # Separamos los tres componentes para debugging/analysis
+    # (aunque solo retornamos el total)
+    accu_mean = 0.0  # Acumulador de mean matching cost
+    accu_var = 0.0  # Acumulador de variance matching cost
+    accu_cov = 0.0  # Acumulador de covariance matching cost
+
+    # PASO 4: Loop temporal principal
+    # Evoluciona momentos desde t=0 hasta t=t_max
+    # Acumula costo solo en ventana de evaluación (últimos min_time segundos)
+    # objective.ml lines 379-401
+    for t in range(n_time_bins):
+        # SUB-PASO 4a: Evolucionar momentos un paso temporal Δt
+        # Usa método de Euler explícito para integrar Eqs. 17-19
+        # Actualiza (μ, Σ, Σ*) in-place para siguiente iteración
+        mu, sigma, sigma_star = evolve_moments_single_step(
+            mu, sigma, sigma_star, w, h, sigma_eta,
+            dt, tau_eta, inv_taus, k
+        )
+
+        # SUB-PASO 4b: Evaluar y acumular costo (condicionalmente)
+        # Condición 1: t >= (n_time_bins - min_time_bins)
+        #   → Solo en últimos min_time segundos (ventana de evaluación)
+        #   → Evita transientes iniciales cuando red se estabiliza
+        # Condición 2: t % subsamp_bins == 0
+        #   → Solo cada t_subsamp segundos (subsampling)
+        #   → Reduce costo computacional sin perder información
+        # objective.ml lines 393-400
+        if t >= (n_time_bins - min_time_bins) and t % subsamp_bins == 0:
+            # Extraer solo neuronas EXCITATORIAS (primeras m)
+            # Las I neurons (últimas n-m) no se usan para costo
+            # porque GSM solo provee targets para orientaciones (E)
+            mu_exc = mu[:m]  # Media de E neurons
+            sigma_exc = sigma[:m, :m]  # Covarianza de E neurons
+
+            # Calcular los tres componentes de costo
+            # Compara μ_exc, Σ_exc con μ_target, Σ_target del GSM
+            c_mean, c_var, c_cov = compute_cost_components(
+                mu_exc, sigma_exc, target_mu, target_sigma,
+                lambda_mean, lambda_var, lambda_cov
+            )
+
+            # Acumular costos para este timestep
+            # El costo total será la suma sobre todos los timesteps evaluados
+            accu_mean += c_mean
+            accu_var += c_var
+            accu_cov += c_cov
+
+    # PASO 5: Calcular costo total
+    # L = Σ_t [L_mean(t) + L_var(t) + L_cov(t)]
+    # Este es el escalar que se minimiza durante optimización
+    total_cost = accu_mean + accu_var + accu_cov
+
+    # PASO 6: Retornar costo y estados finales
+    # - total_cost: usado por optimizador (float)
+    # - mu, sigma: útiles para debugging/visualización
+    return float(total_cost), mu, sigma
+
+
+# =============================================================================
+# Optimization objective function
+# =============================================================================
+
+def create_objective_function(
+    gsm_model, N_E, N_I, tau_e, tau_i, tau_eta, k,
+    dt, t_max, t_subsamp, min_time=0.05,
+    lambda_mean=1.0, lambda_var=1.0, lambda_cov=1.0
+):
+    """
+    Create objective function for L-BFGS-B optimization.
+
+    Crea la función objetivo que será minimizada durante el
+    entrenamiento usando L-BFGS-B.
+
+    Parameters
+    ----------
+    gsm_model : object
+        Pre-trained GSM model with target statistics
+    N_E : int
+        Number of excitatory neurons
+    N_I : int
+        Number of inhibitory neurons
+    tau_e : float
+        Excitatory time constant (seconds)
+    tau_i : float
+        Inhibitory time constant (seconds)
+    tau_eta : float
+        Noise autocorrelation time (seconds)
+    k : float
+        Supralinear scaling constant
+    dt : float
+        Time step (seconds)
+    t_max : float
+        Maximum integration time (seconds)
+    t_subsamp : float
+        Cost subsampling interval (seconds)
+    min_time : float
+        Minimum time before cost evaluation
+    lambda_mean : float
+        Mean matching weight
+    lambda_var : float
+        Variance matching weight
+    lambda_cov : float
+        Covariance matching weight
+
+    Returns
+    -------
+    objective_fn : callable
+        Objective function f(x) -> cost
+    gradient_fn : callable
+        Gradient function f'(x) -> grad
+
+    Notes
+    -----
+    La función objetivo empaqueta/desempaqueta parámetros
+    y calcula el costo usando ADF.
+    """
+    n = N_E + N_I
+
+    # Inverse time constants
+    inv_taus = jnp.concatenate([
+        jnp.full(N_E, 1.0 / tau_e),
+        jnp.full(N_I, 1.0 / tau_i)
+    ])
+
+    # Placeholder: necesitamos el GSM model para obtener h y targets
+    # Por ahora, usamos valores dummy
+    h_vec = jnp.ones(n)  # Será reemplazado con h del GSM
+    target_mu = jnp.zeros(N_E)  # Será reemplazado con μ del GSM posterior
+    target_sigma = jnp.eye(N_E)  # Será reemplazado con Σ del GSM posterior
+
+    def unpack_parameters(x):
+        """Desempaquetar vector de optimización a parámetros físicos."""
+        # Implementación basada en objective.ml lines 153-180
+        params = {}
+        params['a_EE'] = 0.01 + x[0]**2
+        params['a_EI'] = 0.01 + x[1]**2
+        params['a_IE'] = 0.01 + x[2]**2
+        params['a_II'] = 0.01 + x[3]**2
+        params['d_EE'] = x[4]
+        params['d_EI'] = x[5]
+        params['d_IE'] = x[6]
+        params['d_II'] = x[7]
+        return params
+
+    def build_w_from_params(params):
+        """Construir matriz W desde parámetros."""
+        # Basado en objective.ml lines 277-287
+        W = jnp.zeros((n, n))
+
+        # Orientaciones en el ring
+        theta = jnp.linspace(0, jnp.pi, N_E, endpoint=False)
+
+        # Función auxiliar para construir bloques
+        def connectivity_block(theta_pre, theta_post, a, d, sign):
+            delta = theta_pre[:, None] - theta_post[None, :]
+            return sign * a * jnp.exp(
+                (jnp.cos(2 * delta) - 1) / (d**2)
+            )
+
+        # Construir bloques
+        W = W.at[:N_E, :N_E].set(
+            connectivity_block(theta, theta, params['a_EE'],
+                               params['d_EE'], 1.0)
+        )
+        W = W.at[:N_E, N_E:].set(
+            connectivity_block(theta, theta, params['a_EI'],
+                               params['d_EI'], -1.0)
+        )
+        W = W.at[N_E:, :N_E].set(
+            connectivity_block(theta, theta, params['a_IE'],
+                               params['d_IE'], 1.0)
+        )
+        W = W.at[N_E:, N_E:].set(
+            connectivity_block(theta, theta, params['a_II'],
+                               params['d_II'], -1.0)
+        )
+
+        return W
+
+    def build_sigma_eta(width, std_e, std_i, rho):
+        """Construir matriz de covarianza de ruido."""
+        # Basado en objective.ml lines 289-304
+        var_e = std_e ** 2
+        var_i = std_i ** 2
+
+        theta = jnp.linspace(0, jnp.pi, N_E, endpoint=False)
+        delta = theta[:, None] - theta[None, :]
+
+        # Kernel espacial
+        spatial_kernel = jnp.exp((jnp.cos(delta) - 1) / (width**2))
+
+        # Construir bloques
+        Sigma_ee = var_e * spatial_kernel
+        Sigma_ii = var_i * spatial_kernel
+        Sigma_ei = rho * jnp.sqrt(var_e * var_i) * spatial_kernel
+
+        # Ensamblar matriz completa
+        Sigma_eta = jnp.block([
+            [Sigma_ee, Sigma_ei],
+            [Sigma_ei.T, Sigma_ii]
+        ])
+
+        # Agregar término diagonal para estabilidad
+        Sigma_eta = Sigma_eta + 0.01 * jnp.eye(n)
+
+        return Sigma_eta
+
+    def objective(x):
+        """Función objetivo para optimización."""
+        # Desempaquetar parámetros
+        params = unpack_parameters(x)
+
+        # Construir matrices
+        w = build_w_from_params(params)
+
+        # Sigma_eta fijo por ahora (Stage 1)
+        sigma_eta = build_sigma_eta(0.8, 2.0, 2.0, 0.8)
+
+        # Calcular costo
+        cost, _, _ = compute_evolution_costs(
+            w, h_vec, sigma_eta, inv_taus,
+            dt, tau_eta, t_max, t_subsamp,
+            target_mu, target_sigma, k,
+            lambda_mean, lambda_var, lambda_cov,
+            min_time
+        )
+
+        return cost
+
+    # Crear función de gradiente usando JAX
+    gradient_fn = jax.grad(objective)
+
+    return objective, gradient_fn

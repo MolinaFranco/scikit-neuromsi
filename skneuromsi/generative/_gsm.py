@@ -440,6 +440,134 @@ class GSM:
         """Get the prior covariance matrix (C matrix)."""
         return self.C.copy()
 
+    def compute_posterior_moments(self, x, z_map=None):
+        """
+        Compute posterior moments (mean and covariance) for GSM inference.
+
+        Implementa el cálculo del posterior P(y|x,z) del modelo GSM
+        siguiendo Echeveste et al. (2020).
+
+        Based on ssn_inference_numerical_experiments/GSM/GSM.py
+        lines 101-112 (get_post_moments functions).
+
+        Mathematical foundation:
+        - Main paper Eq. 1-2: GSM generative model x = z*A*y + noise
+        - Posterior: P(y|x,z) = N(μ_post, Σ_post)
+        - μ_post = (z/σ_x²) * Σ_post * A^T * x
+        - Σ_post = [C^(-1) + (z²/σ_x²) * A^T*A]^(-1)
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Observed image patch (flattened), shape (patch_dim,)
+        z_map : float, optional
+            MAP estimate of contrast. If None, uses fixed value 0.5
+
+        Returns
+        -------
+        mu_post : np.ndarray
+            Posterior mean of orientation representation, shape (n_orient,)
+        Sigma_post : np.ndarray
+            Posterior covariance matrix, shape (n_orient, n_orient)
+
+        Notes
+        -----
+        Esta función calcula los momentos del posterior condicional
+        en el contraste z (asumiendo z conocido o en su valor MAP).
+        Para inference completa, se debería integrar sobre P(z|x).
+        """
+        # Contraste MAP (por defecto o proporcionado)
+        if z_map is None:
+            # Heurística simple: usar contraste medio
+            z_map = 0.5
+
+        # Varianza del ruido de observación
+        s_x_2 = self.noise_variance
+
+        # Calcular Σ_post = [C^(-1) + (z²/σ_x²) * A^T*A]^(-1)
+        # (GSM.py line 110-112)
+        M = self.C_inv + (z_map**2 / s_x_2) * self.ATA
+        Sigma_post = np.linalg.inv(M)
+
+        # Calcular μ_post = (z/σ_x²) * Σ_post * A^T * x
+        # (GSM.py line 106-107)
+        mu_post = (z_map / s_x_2) * Sigma_post @ (self.A.T @ x)
+
+        return mu_post, Sigma_post
+
+    def compute_posterior_for_ssn_training(
+        self, contrast, n_samples=100, z_map=None
+    ):
+        """
+        Compute target posterior statistics for SSN training.
+
+        Genera múltiples muestras de estímulos con un contraste dado
+        y calcula los momentos promedio del posterior, que servirán
+        como targets para el entrenamiento del SSN.
+
+        Parameters
+        ----------
+        contrast : float
+            Contrast level for stimulus generation
+        n_samples : int, optional
+            Number of samples to average over (default: 100)
+        z_map : float, optional
+            MAP contrast estimate (if None, uses contrast value)
+
+        Returns
+        -------
+        dict
+            Dictionary containing:
+            - 'target_mu': Average posterior mean, shape (n_orientations,)
+            - 'target_sigma': Average posterior covariance,
+              shape (n_orientations, n_orientations)
+            - 'h_inputs': SSN input vectors h, shape (n_samples, n_orient)
+            - 'stimuli': Generated image patches, shape (n_samples, patch_dim)
+
+        Notes
+        -----
+        Esta función genera los targets necesarios para entrenar el SSN:
+        1. Genera n_samples estímulos con el contraste especificado
+        2. Calcula el posterior GSM para cada uno
+        3. Promedia los momentos para obtener estadísticas target
+        4. Retorna también los inputs h correspondientes
+        """
+        if z_map is None:
+            z_map = contrast
+
+        # Almacenamiento
+        all_mu = []
+        all_Sigma = []
+        all_h = []
+        all_x = []
+
+        # Generar muestras
+        for _ in range(n_samples):
+            # Generar estímulo
+            stim_data = self.generate_stimulus_patch(contrast)
+            x = stim_data['x']
+            all_x.append(x)
+
+            # Calcular posterior GSM
+            mu_post, Sigma_post = self.compute_posterior_moments(x, z_map)
+            all_mu.append(mu_post)
+            all_Sigma.append(Sigma_post)
+
+            # Generar input h para SSN
+            h = self.generate_h_input_efficient(x)
+            all_h.append(h)
+
+        # Promediar momentos
+        target_mu = np.mean(all_mu, axis=0)
+        target_Sigma = np.mean(all_Sigma, axis=0)
+
+        return {
+            'target_mu': target_mu,
+            'target_sigma': target_Sigma,
+            'h_inputs': np.array(all_h),
+            'stimuli': np.array(all_x),
+        }
+
 
 # CONVENIENCE FUNCTIONS =======================================================
 
