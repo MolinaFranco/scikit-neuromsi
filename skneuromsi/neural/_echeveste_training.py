@@ -1050,9 +1050,10 @@ def compute_evolution_costs(
     total_cost = accu_mean + accu_var + accu_cov
 
     # PASO 6: Retornar costo y estados finales
-    # - total_cost: usado por optimizador (float)
+    # - total_cost: usado por optimizador (JAX array, no convertir a float)
     # - mu, sigma: útiles para debugging/visualización
-    return float(total_cost), mu, sigma
+    # IMPORTANTE: No usar float() aquí porque rompe autodiff de JAX
+    return total_cost, mu, sigma
 
 
 # =============================================================================
@@ -1105,8 +1106,16 @@ def create_objective_function(
     -------
     objective_fn : callable
         Objective function f(x) -> cost
+        Maps 15-parameter vector to scalar cost
     gradient_fn : callable
         Gradient function f'(x) -> grad
+        Returns gradient with respect to all 15 parameters
+    pack_fn : callable
+        Function to pack physical parameters into optimization vector
+        Signature: pack_fn(params_dict) -> x
+    unpack_fn : callable
+        Function to unpack optimization vector to physical parameters
+        Signature: unpack_fn(x) -> params_dict
 
     Notes
     -----
@@ -1127,18 +1136,154 @@ def create_objective_function(
     target_mu = jnp.zeros(N_E)  # Será reemplazado con μ del GSM posterior
     target_sigma = jnp.eye(N_E)  # Será reemplazado con Σ del GSM posterior
 
-    def unpack_parameters(x):
-        """Desempaquetar vector de optimización a parámetros físicos."""
-        # Implementación basada en objective.ml lines 153-180
+    def pack_parameters(params, input_baseline_lb=0.1):
+        """
+        Pack physical parameters into optimization vector.
+
+        This is the inverse operation of unpack_parameters. It packs
+        the 15 physical parameters into a vector for optimization,
+        applying the appropriate transformations.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary with physical parameters:
+            - 'input_baseline': α_h
+            - 'input_scaling': β_h
+            - 'input_nl_pow': γ_h
+            - 'a_EE', 'a_EI', 'a_IE', 'a_II': weight heights
+            - 'd_EE', 'd_EI', 'd_IE', 'd_II': weight widths
+            - 'sigma_eta_width': d_σ
+            - 'sigma_eta_std_e': σ_E
+            - 'sigma_eta_std_i': σ_I
+            - 'sigma_eta_rho': ρ (in [0, 1])
+
+        input_baseline_lb : float, optional
+            Lower bound for input baseline. Default is 0.1.
+
+        Returns
+        -------
+        x : jax.numpy.ndarray, shape (15,)
+            Packed optimization vector
+
+        References
+        ----------
+        .. [1] ssn_inference_optimizer/objective.ml lines 185-214
+        """
+        x = jnp.zeros(15)
+
+        # Input transformation parameters (indices 0-2)
+        # Inverse of: α_h = α_h_lb + x[0]²
+        x = x.at[0].set(jnp.sqrt(params['input_baseline'] -
+                                 input_baseline_lb))
+        x = x.at[1].set(jnp.sqrt(params['input_scaling']))
+        x = x.at[2].set(jnp.sqrt(params['input_nl_pow']))
+
+        # Weight matrix heights (indices 3-6)
+        # Inverse of: a = 0.01 + x²
+        # Check that heights are > 0.01
+        for i, key in enumerate(['a_EE', 'a_EI', 'a_IE', 'a_II']):
+            h = params[key]
+            if h <= 0.011:
+                raise ValueError(
+                    f"Weight height {key}={h} must be > 0.011"
+                )
+            x = x.at[3 + i].set(jnp.sqrt(h - 0.01))
+
+        # Weight matrix widths (indices 7-10)
+        for i, key in enumerate(['d_EE', 'd_EI', 'd_IE', 'd_II']):
+            x = x.at[7 + i].set(params[key])
+
+        # Noise covariance parameters (indices 11-14)
+        x = x.at[11].set(params['sigma_eta_width'])
+        x = x.at[12].set(params['sigma_eta_std_e'])
+        x = x.at[13].set(params['sigma_eta_std_i'])
+
+        # Inverse of: ρ = 0.5 * (1 + tanh(x[14]))
+        # This gives: x[14] = arctanh(2*ρ - 1)
+        # Using: arctanh(z) = 0.5 * (log(1+z) - log(1-z))
+        rho = params['sigma_eta_rho']
+        z = 2.0 * rho - 1.0
+        rho_packed = 0.5 * (jnp.log(1.0 + z) - jnp.log(1.0 - z))
+        x = x.at[14].set(rho_packed)
+
+        return x
+
+    def unpack_parameters(x, input_baseline_lb=0.1):
+        """
+        Unpack optimization vector to physical parameters.
+
+        Unpacks the 15-parameter vector into physical parameters for the
+        SSN model following the parametrization in Echeveste et al. 2020.
+
+        Parameters
+        ----------
+        x : array_like, shape (15,)
+            Optimization parameter vector. The parameters are packed in
+            the following order (see objective.ml lines 153-180):
+            - x[0]: input_baseline (α_h) - transformed as α_h_lb + x[0]²
+            - x[1]: input_scaling (β_h) - transformed as x[1]²
+            - x[2]: input_nl_pow (γ_h) - transformed as x[2]²
+            - x[3:7]: Weight heights a_EE, a_EI, a_IE, a_II
+            - x[7:11]: Weight widths d_EE, d_EI, d_IE, d_II
+            - x[11]: Noise width (d_σ)
+            - x[12]: Noise E std (σ_E)
+            - x[13]: Noise I std (σ_I)
+            - x[14]: Noise correlation (ρ) - transformed via tanh
+
+        input_baseline_lb : float, optional
+            Lower bound for input baseline. Default is 0.1.
+
+        Returns
+        -------
+        params : dict
+            Dictionary with unpacked parameters:
+            - 'input_baseline': α_h
+            - 'input_scaling': β_h
+            - 'input_nl_pow': γ_h
+            - 'a_EE', 'a_EI', 'a_IE', 'a_II': weight heights
+            - 'd_EE', 'd_EI', 'd_IE', 'd_II': weight widths
+            - 'sigma_eta_width': d_σ
+            - 'sigma_eta_std_e': σ_E
+            - 'sigma_eta_std_i': σ_I
+            - 'sigma_eta_rho': ρ
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Nature Neuroscience, Eq. 10, 12-14
+        .. [2] ssn_inference_optimizer/objective.ml lines 153-180
+        """
         params = {}
-        params['a_EE'] = 0.01 + x[0]**2
-        params['a_EI'] = 0.01 + x[1]**2
-        params['a_IE'] = 0.01 + x[2]**2
-        params['a_II'] = 0.01 + x[3]**2
-        params['d_EE'] = x[4]
-        params['d_EI'] = x[5]
-        params['d_IE'] = x[6]
-        params['d_II'] = x[7]
+
+        # Input transformation parameters (indices 0-2)
+        # Ref: objective.ml lines 157-159
+        params['input_baseline'] = input_baseline_lb + x[0]**2
+        params['input_scaling'] = x[1]**2
+        params['input_nl_pow'] = x[2]**2
+
+        # Weight matrix heights (indices 3-6)
+        # Ref: objective.ml lines 161-164
+        # Minimum value of 0.01 ensures numerical stability
+        params['a_EE'] = 0.01 + x[3]**2
+        params['a_EI'] = 0.01 + x[4]**2
+        params['a_IE'] = 0.01 + x[5]**2
+        params['a_II'] = 0.01 + x[6]**2
+
+        # Weight matrix widths (indices 7-10)
+        # Ref: objective.ml lines 165-168
+        params['d_EE'] = x[7]
+        params['d_EI'] = x[8]
+        params['d_IE'] = x[9]
+        params['d_II'] = x[10]
+
+        # Noise covariance parameters (indices 11-14)
+        # Ref: objective.ml lines 174-178
+        params['sigma_eta_width'] = x[11]
+        params['sigma_eta_std_e'] = x[12]
+        params['sigma_eta_std_i'] = x[13]
+        # rho is constrained to [0, 1] via tanh transformation
+        params['sigma_eta_rho'] = 0.5 * (1.0 + jnp.tanh(x[14]))
+
         return params
 
     def build_w_from_params(params):
@@ -1176,48 +1321,143 @@ def create_objective_function(
 
         return W
 
-    def build_sigma_eta(width, std_e, std_i, rho):
-        """Construir matriz de covarianza de ruido."""
-        # Basado en objective.ml lines 289-304
+    def build_sigma_eta(params):
+        """
+        Build noise covariance matrix Σ_η from parameters.
+
+        Constructs the noise covariance matrix following the
+        parametrization in Echeveste et al. 2020, Equations 12-13.
+        The covariance is spatially structured with a squared
+        exponential kernel.
+
+        Parameters
+        ----------
+        params : dict
+            Parameter dictionary containing:
+            - 'sigma_eta_width': spatial width d_σ
+            - 'sigma_eta_std_e': E population std σ_E
+            - 'sigma_eta_std_i': I population std σ_I
+            - 'sigma_eta_rho': E-I correlation ρ
+
+        Returns
+        -------
+        Sigma_eta : jax.numpy.ndarray, shape (2*N_E, 2*N_E)
+            Noise covariance matrix.
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Eq. 12-13
+        .. [2] ssn_inference_optimizer/objective.ml lines 289-304
+        """
+        # Extract parameters
+        width = params['sigma_eta_width']
+        std_e = params['sigma_eta_std_e']
+        std_i = params['sigma_eta_std_i']
+        rho = params['sigma_eta_rho']
+
         var_e = std_e ** 2
         var_i = std_i ** 2
 
         theta = jnp.linspace(0, jnp.pi, N_E, endpoint=False)
+        # Δθ
         delta = theta[:, None] - theta[None, :]
 
-        # Kernel espacial
+        # Spatial kernel: exp((cos(Δθ) - 1) / d_σ²)
+        # Ref: objective.ml line 303
         spatial_kernel = jnp.exp((jnp.cos(delta) - 1) / (width**2))
 
-        # Construir bloques
+        # Build blocks of the covariance matrix
+        # Ref: Echeveste et al. 2020, Eq. 12-13
         Sigma_ee = var_e * spatial_kernel
         Sigma_ii = var_i * spatial_kernel
         Sigma_ei = rho * jnp.sqrt(var_e * var_i) * spatial_kernel
 
-        # Ensamblar matriz completa
+        # Assemble full matrix
         Sigma_eta = jnp.block([
             [Sigma_ee, Sigma_ei],
             [Sigma_ei.T, Sigma_ii]
         ])
 
-        # Agregar término diagonal para estabilidad
+        # Add small diagonal term for numerical stability
+        # Ref: objective.ml line 305
         Sigma_eta = Sigma_eta + 0.01 * jnp.eye(n)
 
         return Sigma_eta
 
+    def transform_h_input(h_vec, params):
+        """
+        Transform input h using learned nonlinear transformation.
+
+        Applies the nonlinear transformation:
+        h = β_h · (h_vec + α_h)^γ_h
+
+        Parameters
+        ----------
+        h_vec : array_like
+            Input vector from GSM model
+        params : dict
+            Parameter dictionary containing:
+            - 'input_baseline': α_h
+            - 'input_scaling': β_h
+            - 'input_nl_pow': γ_h
+
+        Returns
+        -------
+        h : jax.numpy.ndarray
+            Transformed input vector
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Nature Neuroscience, Eq. 14
+        .. [2] ssn_inference_optimizer/objective.ml lines 410-413
+        """
+        alpha_h = params['input_baseline']
+        beta_h = params['input_scaling']
+        gamma_h = params['input_nl_pow']
+
+        # h = β_h · exp(γ_h · log(h_vec + α_h))
+        # This is equivalent to: h = β_h · (h_vec + α_h)^γ_h
+        # Ref: objective.ml line 413
+        return beta_h * jnp.exp(gamma_h * jnp.log(h_vec + alpha_h))
+
     def objective(x):
-        """Función objetivo para optimización."""
-        # Desempaquetar parámetros
+        """
+        Optimization objective function.
+
+        Computes the total cost for the SSN training following
+        Echeveste et al. 2020. The cost includes matching terms
+        for mean, variance, and covariance, plus regularization.
+
+        Parameters
+        ----------
+        x : array_like, shape (15,)
+            Optimization parameter vector
+
+        Returns
+        -------
+        cost : float
+            Total objective value
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Nature Neuroscience, Eq. 25
+        .. [2] ssn_inference_optimizer/objective.ml lines 469-474
+        """
+        # Unpack all 15 parameters
         params = unpack_parameters(x)
 
-        # Construir matrices
+        # Build connectivity matrix W
         w = build_w_from_params(params)
 
-        # Sigma_eta fijo por ahora (Stage 1)
-        sigma_eta = build_sigma_eta(0.8, 2.0, 2.0, 0.8)
+        # Build noise covariance matrix Σ_η
+        sigma_eta = build_sigma_eta(params)
 
-        # Calcular costo
+        # Transform input h
+        h = transform_h_input(h_vec, params)
+
+        # Compute evolution costs
         cost, _, _ = compute_evolution_costs(
-            w, h_vec, sigma_eta, inv_taus,
+            w, h, sigma_eta, inv_taus,
             dt, tau_eta, t_max, t_subsamp,
             target_mu, target_sigma, k,
             lambda_mean, lambda_var, lambda_cov,
@@ -1226,7 +1466,9 @@ def create_objective_function(
 
         return cost
 
-    # Crear función de gradiente usando JAX
+    # Create gradient function using JAX automatic differentiation
     gradient_fn = jax.grad(objective)
 
-    return objective, gradient_fn
+    # Return tuple: (objective, gradient, pack, unpack)
+    # This allows users to easily initialize optimization and inspect params
+    return objective, gradient_fn, pack_parameters, unpack_parameters
