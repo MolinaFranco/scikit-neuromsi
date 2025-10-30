@@ -1885,7 +1885,7 @@ class Echeveste2020(SKNMSIMethodABC):
 
         # Construir bloques de conectividad usando parametric_connectivity
         def connectivity_block(theta_pre, theta_post, a, d, sign=1):
-            delta_theta = theta_pre[:, None] - theta_post[None, :]
+            delta_theta = theta_post[:, None] - theta_pre[None, :]
             return sign * a * np.exp((np.cos(2 * delta_theta) - 1) / d**2)
 
         # Bloques matriciales con signos correctos según código original
