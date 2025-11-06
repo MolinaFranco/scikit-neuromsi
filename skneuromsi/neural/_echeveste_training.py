@@ -1130,13 +1130,20 @@ def create_objective_function(
         jnp.full(N_I, 1.0 / tau_i)
     ])
 
+    # Calcular input_baseline_lb dinámicamente desde el GSM
+    # Ref: ssn_inference_optimizer/train.ml lines 47-49
+    # Este valor garantiza que beta_h + filter_response >= 0.1
+    # para todos los datos de entrenamiento
+    input_baseline_lb = gsm_model.compute_input_baseline_lb(n_samples=100)
+    print(f"Calculated input_baseline_lb: {input_baseline_lb:.6f}")
+
     # Placeholder: necesitamos el GSM model para obtener h y targets
     # Por ahora, usamos valores dummy
     h_vec = jnp.ones(n)  # Será reemplazado con h del GSM
     target_mu = jnp.zeros(N_E)  # Será reemplazado con μ del GSM posterior
     target_sigma = jnp.eye(N_E)  # Será reemplazado con Σ del GSM posterior
 
-    def pack_parameters(params, input_baseline_lb=0.1):
+    def pack_parameters(params):
         """
         Pack physical parameters into optimization vector.
 
@@ -1144,22 +1151,22 @@ def create_objective_function(
         the 15 physical parameters into a vector for optimization,
         applying the appropriate transformations.
 
+        Uses the input_baseline_lb computed dynamically from the GSM
+        model to ensure proper parameter constraints.
+
         Parameters
         ----------
         params : dict
             Dictionary with physical parameters:
-            - 'input_baseline': α_h
-            - 'input_scaling': β_h
-            - 'input_nl_pow': γ_h
+            - 'input_baseline': β_h (offset/baseline)
+            - 'input_scaling': α_h (multiplicador/scaling)
+            - 'input_nl_pow': γ_h (exponente/power)
             - 'a_EE', 'a_EI', 'a_IE', 'a_II': weight heights
             - 'd_EE', 'd_EI', 'd_IE', 'd_II': weight widths
             - 'sigma_eta_width': d_σ
             - 'sigma_eta_std_e': σ_E
             - 'sigma_eta_std_i': σ_I
             - 'sigma_eta_rho': ρ (in [0, 1])
-
-        input_baseline_lb : float, optional
-            Lower bound for input baseline. Default is 0.1.
 
         Returns
         -------
@@ -1169,11 +1176,20 @@ def create_objective_function(
         References
         ----------
         .. [1] ssn_inference_optimizer/objective.ml lines 185-214
+
+        Notes
+        -----
+        The input_baseline_lb used in the transformation is computed
+        from the GSM data to guarantee positive arguments in the
+        nonlinear transformation.
         """
         x = jnp.zeros(15)
 
         # Input transformation parameters (indices 0-2)
-        # Inverse of: α_h = α_h_lb + x[0]²
+        # Ref: objective.ml lines 189-191
+        # x[0] → input_baseline (β_h): offset que garantiza positividad
+        # x[1] → input_scaling (α_h): multiplicador de escala
+        # x[2] → input_nl_pow (γ_h): exponente de la no linealidad
         x = x.at[0].set(jnp.sqrt(params['input_baseline'] -
                                  input_baseline_lb))
         x = x.at[1].set(jnp.sqrt(params['input_scaling']))
@@ -1209,20 +1225,23 @@ def create_objective_function(
 
         return x
 
-    def unpack_parameters(x, input_baseline_lb=0.1):
+    def unpack_parameters(x):
         """
         Unpack optimization vector to physical parameters.
 
         Unpacks the 15-parameter vector into physical parameters for the
         SSN model following the parametrization in Echeveste et al. 2020.
 
+        Uses the input_baseline_lb computed dynamically from the GSM
+        model to ensure proper parameter constraints.
+
         Parameters
         ----------
         x : array_like, shape (15,)
             Optimization parameter vector. The parameters are packed in
             the following order (see objective.ml lines 153-180):
-            - x[0]: input_baseline (α_h) - transformed as α_h_lb + x[0]²
-            - x[1]: input_scaling (β_h) - transformed as x[1]²
+            - x[0]: input_baseline (β_h) - transformed as β_h_lb + x[0]²
+            - x[1]: input_scaling (α_h) - transformed as x[1]²
             - x[2]: input_nl_pow (γ_h) - transformed as x[2]²
             - x[3:7]: Weight heights a_EE, a_EI, a_IE, a_II
             - x[7:11]: Weight widths d_EE, d_EI, d_IE, d_II
@@ -1231,16 +1250,13 @@ def create_objective_function(
             - x[13]: Noise I std (σ_I)
             - x[14]: Noise correlation (ρ) - transformed via tanh
 
-        input_baseline_lb : float, optional
-            Lower bound for input baseline. Default is 0.1.
-
         Returns
         -------
         params : dict
             Dictionary with unpacked parameters:
-            - 'input_baseline': α_h
-            - 'input_scaling': β_h
-            - 'input_nl_pow': γ_h
+            - 'input_baseline': β_h (offset/baseline)
+            - 'input_scaling': α_h (multiplicador/scaling)
+            - 'input_nl_pow': γ_h (exponente/power)
             - 'a_EE', 'a_EI', 'a_IE', 'a_II': weight heights
             - 'd_EE', 'd_EI', 'd_IE', 'd_II': weight widths
             - 'sigma_eta_width': d_σ
@@ -1252,6 +1268,12 @@ def create_objective_function(
         ----------
         .. [1] Echeveste et al. (2020) Nature Neuroscience, Eq. 10, 12-14
         .. [2] ssn_inference_optimizer/objective.ml lines 153-180
+
+        Notes
+        -----
+        The input_baseline_lb used in the transformation is computed
+        from the GSM data to guarantee positive arguments in the
+        nonlinear transformation.
         """
         params = {}
 
@@ -1389,7 +1411,9 @@ def create_objective_function(
         Transform input h using learned nonlinear transformation.
 
         Applies the nonlinear transformation:
-        h = β_h · (h_vec + α_h)^γ_h
+        h = α_h · (β_h + h_vec)^γ_h
+
+        where α_h is scaling, β_h is baseline, γ_h is power.
 
         Parameters
         ----------
@@ -1397,9 +1421,9 @@ def create_objective_function(
             Input vector from GSM model
         params : dict
             Parameter dictionary containing:
-            - 'input_baseline': α_h
-            - 'input_scaling': β_h
-            - 'input_nl_pow': γ_h
+            - 'input_baseline': β_h (offset/baseline)
+            - 'input_scaling': α_h (multiplicador/scaling)
+            - 'input_nl_pow': γ_h (exponente/power)
 
         Returns
         -------
@@ -1410,15 +1434,24 @@ def create_objective_function(
         ----------
         .. [1] Echeveste et al. (2020) Nature Neuroscience, Eq. 14
         .. [2] ssn_inference_optimizer/objective.ml lines 410-413
+            Original formula:
+            prms.input_scaling * exp(prms.input_nl_pow * log(
+                h_vec + prms.input_baseline))
+            = input_scaling · (h_vec + input_baseline)^input_nl_pow
+            = α_h · (β_h + h_vec)^γ_h
         """
-        alpha_h = params['input_baseline']
-        beta_h = params['input_scaling']
+        # Extraer parámetros con nombres correctos según nomenclatura
+        # α_h = input_scaling (multiplicador)
+        # β_h = input_baseline (offset)
+        # γ_h = input_nl_pow (exponente)
+        alpha_h = params['input_scaling']
+        beta_h = params['input_baseline']
         gamma_h = params['input_nl_pow']
 
-        # h = β_h · exp(γ_h · log(h_vec + α_h))
-        # This is equivalent to: h = β_h · (h_vec + α_h)^γ_h
+        # h = α_h · exp(γ_h · log(β_h + h_vec))
+        # This is equivalent to: h = α_h · (β_h + h_vec)^γ_h
         # Ref: objective.ml line 413
-        return beta_h * jnp.exp(gamma_h * jnp.log(h_vec + alpha_h))
+        return alpha_h * jnp.exp(gamma_h * jnp.log(beta_h + h_vec))
 
     def objective(x):
         """
@@ -1472,3 +1505,281 @@ def create_objective_function(
     # Return tuple: (objective, gradient, pack, unpack)
     # This allows users to easily initialize optimization and inspect params
     return objective, gradient_fn, pack_parameters, unpack_parameters
+
+
+# =============================================================================
+# Sample-based stochastic optimization (for ADAM stage)
+# =============================================================================
+
+
+def simulate_ssn_with_noise(w, h_vec, sigma_eta, inv_taus, dt,
+                            tau_eta, t_max, k, key, u_init=None):
+    """
+    Simulate SSN dynamics with process noise for one trial.
+
+    This function implements stochastic simulation of the SSN dynamics
+    (Eq. 8) by integrating with Euler-Maruyama method and adding
+    correlated noise at each timestep.
+
+    Based on Echeveste et al. (2020) Methods section:
+    "we employed a stochastic gradient method using N_trial = 50 trials
+    for each training stimulus to estimate the corresponding moments of
+    network responses"
+
+    Parameters
+    ----------
+    w : jax.Array, shape (N, N)
+        Connectivity matrix
+    h_vec : jax.Array, shape (N,)
+        External input vector
+    sigma_eta : jax.Array, shape (N, N)
+        Noise covariance matrix
+    inv_taus : jax.Array, shape (N,)
+        Inverse time constants (1/τ_α)
+    dt : float
+        Integration timestep (seconds)
+    tau_eta : float
+        Noise correlation time constant (seconds)
+    t_max : float
+        Total simulation time (seconds)
+    k : float
+        Supralinear activation scaling factor
+    key : jax.random.PRNGKey
+        Random key for noise generation
+    u_init : jax.Array, shape (N,), optional
+        Initial membrane potentials. If None, sampled from N(0, I)
+
+    Returns
+    -------
+    u_trajectory : jax.Array, shape (n_steps, N)
+        Trajectory of membrane potentials over time
+    r_trajectory : jax.Array, shape (n_steps, N)
+        Trajectory of firing rates over time
+
+    References
+    ----------
+    .. [1] Echeveste et al. (2020) Nature Neuroscience, Methods page 18
+    .. [2] ssn_inference_optimizer/objective.ml lines 485-515
+    """
+    N = len(h_vec)
+    n_steps = int(t_max / dt)
+
+    # Inicialización: condiciones iniciales
+    # Paper: "Initial conditions were drawn from a Gaussian distribution
+    # N(μ0, Σ0)"
+    if u_init is None:
+        key, subkey = jax.random.split(key)
+        # Por simplicidad usamos N(0, I). En el paper usan valores específicos
+        # (Supplementary Table S1)
+        u_init = jax.random.normal(subkey, shape=(N,))
+
+    # Factorización de Cholesky de Σ_η para generar ruido correlacionado
+    # η_t ~ N(0, Σ_η) se genera como: η_t = L @ ξ_t donde ξ_t ~ N(0, I)
+    L_eta = jnp.linalg.cholesky(sigma_eta)
+
+    # Ruido correlacionado temporalmente (proceso de Ornstein-Uhlenbeck)
+    # dη/dt = -η/τ_η + ξ(t) donde ξ(t) es ruido blanco
+    # Discretización: η_{t+1} = α·η_t + β·ξ_t
+    # donde α = exp(-dt/τ_η), β = sqrt(Σ_η * (1 - α²))
+    alpha_eta = jnp.exp(-dt / tau_eta)
+    beta_eta_scale = jnp.sqrt(1 - alpha_eta**2)
+
+    def step(carry, t):
+        """Single integration step with noise."""
+        u, eta = carry
+        key_t = jax.random.fold_in(key, t)
+
+        # Activación supralineal: r = k * [u]_+^2
+        r = k * jnp.maximum(0, u)**2
+
+        # Dinámica determinística: du/dt = -u + W@r + h
+        # Ref: Echeveste Eq. 8 (without noise term)
+        f = inv_taus * (-u + w @ r + h_vec)
+
+        # Actualizar ruido correlacionado (Ornstein-Uhlenbeck)
+        # Paper: "the process noise were re-sampled for each trial and
+        # iteration"
+        xi = jax.random.normal(key_t, shape=(N,))
+        noise_white = L_eta @ xi
+        eta_new = alpha_eta * eta + beta_eta_scale * noise_white
+
+        # Integración Euler-Maruyama:
+        # u_{t+1} = u_t + dt * f(u_t) + eta_t
+        u_new = u + dt * f + eta_new
+
+        # Soft threshold para evitar explosión numérica
+        # Ref: objective.ml:538-539
+        # Paper: Limita u al rango ~[-100, 100] para estabilidad
+        soft_gain = 100.0
+        u_new = soft_gain * jnp.tanh(u_new / soft_gain)
+
+        return (u_new, eta_new), (u_new, r)
+
+    # Inicializar ruido
+    key, subkey = jax.random.split(key)
+    eta_init = L_eta @ jax.random.normal(subkey, shape=(N,))
+
+    # Integrar dinámica
+    _, (u_traj, r_traj) = jax.lax.scan(
+        step,
+        (u_init, eta_init),
+        jnp.arange(n_steps)
+    )
+
+    return u_traj, r_traj
+
+
+def compute_costs_with_samples(w, h_vec, sigma_eta, inv_taus, dt,
+                               tau_eta, t_max, t_subsamp, target_mu,
+                               target_sigma, k, lambda_mean, lambda_var,
+                               lambda_cov, min_time, n_trials, key):
+    """
+    Compute costs using sample-based stochastic optimization.
+
+    This function implements the first stage of training described in
+    Echeveste et al. (2020), where N_trial = 50 trials are simulated
+    with process noise to estimate network response moments.
+
+    Based on Echeveste et al. (2020) Methods section, page 18:
+    "During the first stage, we employed a stochastic gradient method
+    using N_trial = 50 trials for each training stimulus to estimate the
+    corresponding moments of network responses"
+
+    The algorithm:
+    1. For each trial k = 1..N_trial:
+       - Sample initial conditions from N(μ0, Σ0)
+       - Simulate SSN dynamics (Eq. 8) with process noise
+       - Collect firing rates during evaluation window [T_min, T_max]
+    2. Compute empirical moments across trials
+    3. Match empirical moments to GSM posterior targets (Eq. 25)
+
+    Parameters
+    ----------
+    w : jax.Array, shape (N, N)
+        Connectivity matrix
+    h_vec : jax.Array, shape (N,)
+        External input vector
+    sigma_eta : jax.Array, shape (N, N)
+        Noise covariance matrix
+    inv_taus : jax.Array, shape (N,)
+        Inverse time constants
+    dt : float
+        Integration timestep (seconds)
+    tau_eta : float
+        Noise correlation time constant (seconds)
+    t_max : float
+        Total simulation time (seconds)
+    t_subsamp : float
+        Subsampling interval for moment computation (seconds)
+    target_mu : jax.Array, shape (N_E,)
+        Target mean from GSM posterior
+    target_sigma : jax.Array, shape (N_E, N_E)
+        Target covariance from GSM posterior
+    k : float
+        Supralinear activation scaling factor
+    lambda_mean : float
+        Weight for mean matching term
+    lambda_var : float
+        Weight for variance matching term
+    lambda_cov : float
+        Weight for covariance matching term
+    min_time : float
+        Start of evaluation window (T_min, seconds)
+    n_trials : int
+        Number of stochastic trials (typically 50)
+    key : jax.random.PRNGKey
+        Random key for reproducibility
+
+    Returns
+    -------
+    cost : float
+        Total cost averaged over trials
+    mu_empirical : jax.Array, shape (N_E,)
+        Empirical mean of firing rates
+    sigma_empirical : jax.Array, shape (N_E, N_E)
+        Empirical covariance of firing rates
+
+    References
+    ----------
+    .. [1] Echeveste et al. (2020) Nature Neuroscience, Methods page 18
+    .. [2] ssn_inference_optimizer/objective.ml lines 517-580
+    """
+    N_E = len(target_mu)  # Número de neuronas excitatorias
+
+    # Índices de tiempo para evaluación
+    # Paper: "the beginning of the averaging time window, T_min in Eqs. 26-28,
+    # was systematically changed ('annealed') from T_min = 0 ms to
+    # T_max - 50 ms"
+    t_min_idx = int(min_time / dt)
+
+    def simulate_trial(key_trial):
+        """Simulate one trial and compute moments."""
+        # Simular dinámica con ruido
+        u_traj, r_traj = simulate_ssn_with_noise(
+            w, h_vec, sigma_eta, inv_taus, dt, tau_eta, t_max, k, key_trial
+        )
+
+        # Submuestrear tasas de disparo en ventana de evaluación
+        # Paper: "we sub-sampled them every t_subsamp = 10 ms"
+        subsamp_factor = int(t_subsamp / dt)
+        r_eval = r_traj[t_min_idx::subsamp_factor, :N_E]  # Solo excitatorias
+
+        # Promedio temporal para este trial
+        # Shape: (N_E,)
+        r_mean_trial = r_eval.mean(axis=0)
+
+        return r_mean_trial, r_eval
+
+    # Simular N_trial trials
+    keys = jax.random.split(key, n_trials)
+    r_means, r_evals = jax.vmap(simulate_trial)(keys)
+
+    # Calcular momentos empíricos across trials
+    # Paper: "estimate the corresponding moments of network responses"
+    mu_empirical = r_means.mean(axis=0)  # Shape: (N_E,)
+
+    # Covarianza empírica
+    # Cov[r_i, r_j] = E[(r_i - E[r_i])(r_j - E[r_j])]
+    r_centered = r_means - mu_empirical[None, :]
+    sigma_empirical = (r_centered.T @ r_centered) / n_trials
+
+    # Normalizar lambdas por tamaño del sistema
+    # Ref: objective.ml:110-113
+    # "give the multipliers their natural scaling with system size"
+    #
+    # Esto es CRÍTICO para que los costos estén en la escala correcta.
+    # Sin esta normalización, los costos son ~500-1000× más grandes.
+    n_time_bins = int(t_max / dt)
+    subsamp_bins = int(t_subsamp / dt)
+    n_subsamp_bins = n_time_bins // subsamp_bins
+    n_targets = 1  # Típicamente 1 target
+
+    lambda_mean_norm = lambda_mean / (2.0 * N_E * n_targets * n_subsamp_bins)
+    lambda_var_norm = lambda_var / (2.0 * N_E * n_targets * n_subsamp_bins)
+    lambda_cov_norm = lambda_cov / (
+        2.0 * N_E * N_E * n_targets * n_subsamp_bins
+    )
+
+    # Función de costo (Eq. 25)
+    # L = λ_μ·||μ - μ_target||² + λ_σ·||diag(Σ) - diag(Σ_target)||²
+    #     + λ_Σ·||Σ - Σ_target||²_F
+
+    # Target variance (diagonal de target_sigma)
+    target_var = jnp.diag(target_sigma)
+    empirical_var = jnp.diag(sigma_empirical)
+
+    # Costo de media (con lambda normalizada)
+    cost_mean = lambda_mean_norm * jnp.sum((mu_empirical - target_mu)**2)
+
+    # Costo de varianza (con lambda normalizada)
+    cost_var = lambda_var_norm * jnp.sum((empirical_var - target_var)**2)
+
+    # Costo de covarianza (norma de Frobenius, con lambda normalizada)
+    cost_cov = lambda_cov_norm * jnp.sum(
+        (sigma_empirical - target_sigma)**2
+    )
+
+    # Costo total
+    total_cost = cost_mean + cost_var + cost_cov
+
+    return total_cost, mu_empirical, sigma_empirical

@@ -342,15 +342,27 @@ class Echeveste2020(SKNMSIMethodABC):
 
     def train(self, gsm_model, stage1_params=None, stage2_params=None):
         """
-        Train the SSN model following the two-stage optimization.
+        Train the SSN model following the two-stage optimization procedure.
 
-        Based on Echeveste et al. (2020).
+        Based on Echeveste et al. (2020) Methods section, page 18:
+
+        **Stage 1: ADAM with stochastic sampling (N_trial = 50)**
+        "During the first stage, we employed a stochastic gradient method
+        using N_trial = 50 trials for each training stimulus to estimate
+        the corresponding moments of network responses, and performed 250
+        iterations of the ADAM optimizer. Both the network's initial
+        conditions and the process noise were re-sampled for each trial
+        and iteration. [...] T_min was systematically changed ('annealed')
+        from T_min = 0 ms to T_max - 50 ms."
+
+        **Stage 2: L-BFGS-B with deterministic ADF**
+        "In the second stage, we continued optimization using the L-BFGS-B
+        optimizer, now using the ADF method to (deterministically) compute
+        the moments of the network's response distribution. We kept the
+        cost-integration time window at its minimum (T_max - T_min = 50 ms)."
+
         The GSM (Gaussian Scale Mixture) generative model must be pre-trained.
         The SSN learns to perform sampling-based inference on this GSM.
-
-        Based on Main paper, página 15: "Sampling-based inference optimization"
-        - Stage 1: Optimize connectivity parameters (8 parameters from Eq. 10)
-        - Stage 2: Optimize other network parameters (stimuli gain, noise, etc)
 
         Parameters
         ----------
@@ -360,14 +372,26 @@ class Echeveste2020(SKNMSIMethodABC):
             - Prior parameters for z and G
             - Trained parameters from natural image statistics
         stage1_params: dict, optional
-            Parameters specific to Stage 1 optimization
+            Parameters specific to Stage 1 (ADAM) optimization:
+            - max_iter: number of ADAM iterations (default: 250)
+            - n_trials: number of samples per iteration (default: 50)
+            - eta: ADAM learning rate (default: 0.002)
+            - beta1, beta2: ADAM momentum parameters
+            - t_min_initial, t_min_final: annealing range
         stage2_params: dict, optional
-            Parameters specific to Stage 2 optimization
+            Parameters specific to Stage 2 (L-BFGS-B) optimization:
+            - max_iter: number of L-BFGS-B iterations (default: 50)
+            - min_time: fixed evaluation window start (default: T_max - 50ms)
 
         Returns
         -------
         dict
             Training results with optimized parameters and convergence metrics
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Nature Neuroscience, Methods page 18
+        .. [2] ssn_inference_optimizer/train.ml
         """
         # Validate GSM model structure
         if not self._validate_gsm_model(gsm_model):
@@ -376,22 +400,61 @@ class Echeveste2020(SKNMSIMethodABC):
         # Stage 1: Optimize connectivity parameters (Eq. 10)
         # Main paper, página 15: First optimize recurrent connectivity
         stage1_results = self._optimize_stage1(gsm_model, stage1_params)
-        self._stage1_completed = True
+
+        # Solo marcar completado si tuvo éxito
+        if stage1_results.get('success', False):
+            self._stage1_completed = True
+            print("✓ Stage 1 completed successfully")
+        else:
+            msg = stage1_results.get('message', 'Unknown error')
+            print(f"✗ Stage 1 failed: {msg}")
+            # No continuar si Stage 1 falla
+            return {
+                "stage1": stage1_results,
+                "stage2": None,
+                "success": False,
+                "error": "Stage 1 optimization failed",
+                "stage1_completed": False,
+                "stage2_completed": False,
+                "is_trained": False,
+            }
 
         # Stage 2: Optimize remaining parameters
         # Main paper, página 16: Then optimize stimulus and noise parameters
         stage2_results = self._optimize_stage2(gsm_model, stage2_params)
-        self._stage2_completed = True
+
+        # Solo marcar completado si tuvo éxito
+        if stage2_results.get('success', False):
+            self._stage2_completed = True
+            print("✓ Stage 2 completed successfully")
+        else:
+            msg = stage2_results.get('message', 'Unknown error')
+            print(f"✗ Stage 2 failed: {msg}")
+            return {
+                "stage1": stage1_results,
+                "stage2": stage2_results,
+                "success": False,
+                "error": "Stage 2 optimization failed",
+                "stage1_completed": True,
+                "stage2_completed": False,
+                "is_trained": False,
+            }
 
         # Build final connectivity matrices from optimized parameters
         self._build_connectivity_matrices()
         self._is_trained = True
+
+        print("✓ Training completed successfully")
 
         return {
             "stage1": stage1_results,
             "stage2": stage2_results,
             "connectivity_params": self._get_connectivity_parameters(),
             "convergence_info": self._get_convergence_info(),
+            "success": True,
+            "stage1_completed": self._stage1_completed,
+            "stage2_completed": self._stage2_completed,
+            "is_trained": self._is_trained,
         }
 
     def _validate_gsm_model(self, gsm_model):
@@ -410,58 +473,73 @@ class Echeveste2020(SKNMSIMethodABC):
 
     def _optimize_stage1(self, gsm_model, params):
         """
-        Stage 1: Optimize recurrent connectivity kernel using Eq. 10.
+        Stage 1: Optimize connectivity using ADAM and sample-based inference.
 
-        In this first stage, the network is trained
-        to approximate the GSM posterior by adjusting
-        only the 8 kernel parameters
-        {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}.
-        These parameters define the shape of the recurrent
-        connectivity matrix W via a circular Gaussian function
-        of orientation difference:
+        Based on Echeveste et al. (2020) Methods section, page 18:
+        "During the first stage, we employed a stochastic gradient method
+        using N_trial = 50 trials for each training stimulus to estimate
+        the corresponding moments of network responses, and performed 250
+        iterations of the ADAM optimizer. Both the network's initial
+        conditions and the process noise were re-sampled for each trial
+        and iteration."
 
+        This stage optimizes the 8 connectivity kernel parameters:
+        {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}
+        which define the connectivity matrix W via Eq. 10:
             W_XY(θi, θj) = a_XY * exp((cos(2(θi - θj)) - 1) / d_XY²)
 
-        Main paper, Eq. 10.
-
-        The optimization minimizes the loss defined in Eq. 25
-        (moment-matching between network activity and GSM posterior statistics)
-        using stochastic simulations of the dynamics (Eq. 8) with noise.
-        Gradients are estimated via backpropagation through time,
-        and parameters are updated using the ADAM optimizer.
-
-        During training, the burn-in window Tmin is annealed
-        to enforce rapid convergence of the network dynamics.
+        Key features:
+        1. ADAM optimizer with stochastic gradients
+        2. Sample-based estimation (N_trial = 50 trials per iteration)
+        3. Temporal annealing: T_min goes from 0ms → (T_max - 50ms)
+        4. Re-sampling of initial conditions and noise each iteration
 
         Parameters
         ----------
         gsm_model: object
-            Pre-trained GSM generative model defining
-            the target posterior statistics.
+            Pre-trained GSM generative model defining target statistics
         params: dict
-            Stage 1 specific parameters (optimizer settings,
-            number of trials, constraints, etc.)
+            Stage 1 specific parameters (optimizer settings, etc.)
 
         Returns
         -------
         dict
-            Optimization results for Stage 1 (final kernel
-            parameters, loss trajectory, etc.)
+            Optimization results for Stage 1
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Nature Neuroscience, Methods page 18
+        .. [2] ssn_inference_optimizer/train.ml lines 280-293
         """
-        from scipy.optimize import minimize
-        from ._echeveste_training import compute_evolution_costs
+        from ._echeveste_training import compute_costs_with_samples
+        import jax
         import jax.numpy as jnp
 
-        # Parámetros por defecto de Stage 1
-        # Basado en train.ml líneas 72-104
+        # Parámetros por defecto siguiendo el paper exactamente
+        # Paper Methods page 18
         if params is None:
             params = {}
 
-        # Parámetros de optimización
-        max_iter = params.get('max_iter', 100)
-        dt = params.get('dt', 0.2e-3)  # 0.2ms
-        t_max = params.get('t_max', 0.1)  # 100ms
-        t_subsamp = params.get('t_subsamp', 10.0e-3)  # 10ms
+        # Parámetros de ADAM optimizer
+        # train.ml lines 288-292
+        max_iter = params.get('max_iter', 250)  # Paper: 250 iterations
+        n_trials = params.get('n_trials', 50)   # Paper: N_trial = 50
+        eta = params.get('eta', 0.002)          # Learning rate (default 0.002)
+        beta1 = params.get('beta1', 0.9)        # ADAM β1
+        beta2 = params.get('beta2', 0.999)      # ADAM β2
+        epsilon_adam = params.get('epsilon', 1e-8)  # ADAM ε
+
+        # Parámetros de simulación
+        dt = params.get('dt', 0.2e-3)           # 0.2ms timestep
+        t_max = params.get('t_max', 0.1)        # 100ms total simulation
+        t_subsamp = params.get('t_subsamp', 10.0e-3)  # 10ms subsampling
+
+        # Paper: "T_min was systematically changed ('annealed') from
+        # T_min = 0 ms (stimulus onset) to T_max - 50 ms"
+        t_min_initial = params.get('t_min_initial', 0.0)      # 0ms
+        t_min_final = params.get('t_min_final', t_max - 0.05)  # T_max - 50ms
+
+        # Parámetros de costo
         lambda_mean = params.get('lambda_mean', 1.0)
         lambda_var = params.get('lambda_var', 1.0)
         lambda_cov = params.get('lambda_cov', 1.0)
@@ -482,14 +560,11 @@ class Echeveste2020(SKNMSIMethodABC):
         # Pack parámetros iniciales
         x0 = self._pack_parameters(initial_params)
 
-        # Upper bounds (train.ml líneas 235-238)
-        # Para width parameters: sqrt(2), otros: infinito
-        bounds = []
-        for i in range(8):
-            if i < 4:  # Amplitudes (no upper bound en código original)
-                bounds.append((0, None))
-            else:  # Widths (bounded by sqrt(2))
-                bounds.append((0, np.sqrt(2.0)))
+        # NOTE: Parameter bounds will be enforced manually in ADAM loop
+        # objective.ml lines 235-238:
+        # - Amplitudes (params 0-3): lower bound 0, no upper bound
+        # - Widths (params 4-7): bounded by [0.01, sqrt(2)]
+        #   Lower bound 0.01 prevents division by zero in d²
 
         # Construir inverse time constants
         inv_taus = jnp.concatenate([
@@ -512,13 +587,12 @@ class Echeveste2020(SKNMSIMethodABC):
         # Shape: (n_gsm_orientations,) - típicamente 50 del GSM pre-trained
         h_full = gsm_data['h_inputs'].mean(axis=0)
 
-        # IMPORTANTE: h_full puede tener más orientaciones que el SSN
-        # (ej: GSM con 50 orientations, SSN con 10E+10I=20 neuronas)
-        # Tomamos solo las primeras N_E componentes para neuronas E
-        # y las siguientes N_I para neuronas I
-        # Esto efectivamente "recorta" el input del GSM al tamaño del SSN
+        # IMPORTANTE: Siguiendo el código original de Echeveste
+        # (generalization.py:116), el input h se duplica para neuronas E e I:
+        # h = np.concatenate((h,h)). Las neuronas inhibitorias reciben el
+        # mismo input que las excitatorias (ref: generalization.py:115-116)
         h_e = h_full[:self._N_E]  # Primeras N_E para excitatorias
-        h_i = h_full[self._N_E:self._N_E + self._N_I]  # Siguientes N_I
+        h_i = h_e[:self._N_I]     # Duplicar para inhibitorias (mismo input)
         h_vec = jnp.concatenate([h_e, h_i])  # Shape: (N_E + N_I,)
 
         # Targets del posterior GSM (solo neuronas excitatorias)
@@ -609,42 +683,154 @@ class Echeveste2020(SKNMSIMethodABC):
             ])
 
             # Agregar término diagonal para estabilidad
+            # objective.ml:305
             Sigma_eta = Sigma_eta + 0.01 * jnp.eye(self._N)
 
             return Sigma_eta
 
         sigma_eta = build_sigma_eta()
 
-        # Función objetivo para L-BFGS-B
-        def objective(x):
-            """Calcular costo usando ADF."""
+        # =====================================================================
+        # ADAM Optimizer with Sample-Based Optimization
+        # =====================================================================
+        # Paper Methods page 18: "performed 250 iterations of the ADAM
+        # optimizer. Both the network's initial conditions and the process
+        # noise were re-sampled for each trial and iteration."
+        # train.ml lines 280-293
+
+        print("=" * 60)
+        print("Stage 1: ADAM with sample-based optimization")
+        print("=" * 60)
+        print("Parameters:")
+        print("  Optimizer: ADAM")
+        print(f"  Max iterations: {max_iter}")
+        print(f"  N_trials per iteration: {n_trials}")
+        print(f"  Learning rate (η): {eta}")
+        print(f"  Beta1: {beta1}, Beta2: {beta2}")
+        print(f"  T_min annealing: {t_min_initial*1000:.0f}ms → "
+              f"{t_min_final*1000:.0f}ms")
+        print(f"Initial parameters: {initial_params}")
+        print("=" * 60)
+
+        # Función de costo con sampling estocástico
+        def compute_cost_and_grad(x, iteration, key):
+            """
+            Compute cost and gradient using stochastic sampling.
+
+            Paper: "using N_trial = 50 trials for each training stimulus
+            to estimate the corresponding moments"
+            """
+            # Temporal annealing: T_min increases linearly over iterations
+            # Paper: "T_min was systematically changed ('annealed') from
+            # T_min = 0 ms to T_max - 50 ms"
+            # train.ml lines 240-243
+            progress = iteration / max_iter
+            current_t_min = (
+                t_min_initial + progress * (t_min_final - t_min_initial)
+            )
+
+            # Construir matriz W desde parámetros
             w = build_w_from_params(x)
 
-            cost, _, _ = compute_evolution_costs(
-                w, h_vec, sigma_eta, inv_taus,
-                dt, self._integrator.f.tau_n, t_max, t_subsamp,
+            # Calcular costo con N_trial samples
+            # Paper: "Both the network's initial conditions and the process
+            # noise were re-sampled for each trial and iteration"
+            cost, _, _ = compute_costs_with_samples(
+                w, h_vec, sigma_eta, inv_taus, dt,
+                self._integrator.f.tau_n, t_max, t_subsamp,
                 target_mu, target_sigma, self._integrator.f.k,
-                lambda_mean, lambda_var, lambda_cov
+                lambda_mean, lambda_var, lambda_cov, current_t_min,
+                n_trials, key
             )
 
             return cost
 
-        # Optimización usando L-BFGS-B
-        # train.ml lines 249-278: usa LBFGS para moment-based optimization
-        print("Stage 1: Optimizing connectivity parameters...")
-        print(f"Initial parameters: {initial_params}")
-        print(f"Max iterations: {max_iter}")
+        # Función para calcular gradiente usando JAX autodiff
+        grad_fn = jax.grad(compute_cost_and_grad, argnums=0)
 
-        result = minimize(
-            objective,
-            x0,
-            method='L-BFGS-B',
-            bounds=bounds,
-            options={'maxiter': max_iter, 'disp': True}
-        )
+        # Inicializar parámetros
+        x = x0.copy()
 
-        # Desempaquetar parámetros optimizados
-        optimized_params = self._unpack_parameters(result.x)
+        # Inicializar momentos de ADAM
+        # ADAM mantiene promedios móviles exponenciales de gradientes
+        # (m) y gradientes al cuadrado (v)
+        m = jnp.zeros_like(x)  # First moment (mean of gradients)
+        v = jnp.zeros_like(x)  # Second moment (uncentered variance)
+
+        # Gradient clipping
+        # train.ml line 292: clip = sqrt(n_prms) * 5
+        grad_clip = np.sqrt(len(x)) * 5.0
+
+        # Tracking
+        cost_history = []
+        best_cost = float('inf')
+        best_x = x.copy()
+
+        # Random key para reproducibilidad
+        key = jax.random.PRNGKey(params.get('seed', 42))
+
+        # ADAM optimization loop
+        # Paper: "performed 250 iterations of the ADAM optimizer"
+        for iteration in range(1, max_iter + 1):
+            # Generar nuevo key para este iteration
+            # Paper: "re-sampled for each trial and iteration"
+            key, subkey = jax.random.split(key)
+
+            # Calcular costo y gradiente
+            cost = compute_cost_and_grad(x, iteration, subkey)
+            grad = grad_fn(x, iteration, subkey)
+
+            # Convertir a numpy para manipulación
+            grad = np.array(grad)
+            cost_val = float(cost)
+
+            # Gradient clipping para estabilidad
+            # train.ml line 261
+            grad_norm = np.linalg.norm(grad)
+            if grad_norm > grad_clip:
+                grad = grad * (grad_clip / grad_norm)
+
+            # ADAM update
+            # Paper referencias: Kingma & Ba (2015)
+            m = beta1 * m + (1 - beta1) * grad
+            v = beta2 * v + (1 - beta2) * (grad ** 2)
+
+            # Bias correction
+            m_hat = m / (1 - beta1 ** iteration)
+            v_hat = v / (1 - beta2 ** iteration)
+
+            # Parameter update
+            x = x - eta * m_hat / (jnp.sqrt(v_hat) + epsilon_adam)
+
+            # Apply bounds
+            # train.ml lines 235-238: width parameters bounded by sqrt(2)
+            for i in range(8):
+                if i < 4:  # Amplitudes: lower bound 0
+                    x = x.at[i].set(jnp.maximum(0, x[i]))
+                else:  # Widths: [0.01, sqrt(2)]
+                    x = x.at[i].set(jnp.clip(x[i], 0.01, np.sqrt(2.0)))
+
+            # Track best
+            cost_history.append(cost_val)
+            if cost_val < best_cost:
+                best_cost = cost_val
+                best_x = x.copy()
+
+            # Progress reporting
+            # train.ml line 284: "iteration %5i | cost = %.5f"
+            if iteration % 10 == 0 or iteration == 1:
+                current_t_min = (
+                    t_min_initial +
+                    (iteration / max_iter) * (t_min_final - t_min_initial)
+                )
+                print(f"Iteration {iteration:5d} | "
+                      f"Cost: {cost_val:.5f} | "
+                      f"T_min: {current_t_min*1000:.1f}ms | "
+                      f"||grad||: {grad_norm:.3f}")
+
+        # Use best parameters found
+        x_final = best_x
+        optimized_params = self._unpack_parameters(x_final)
 
         # Actualizar parámetros internos
         self._a_EE = optimized_params['a_EE']
@@ -656,34 +842,45 @@ class Echeveste2020(SKNMSIMethodABC):
         self._d_IE = optimized_params['d_IE']
         self._d_II = optimized_params['d_II']
 
+        print("=" * 60)
+        print("Stage 1 completed:")
+        print(f"  Final cost: {best_cost:.6f}")
+        print(f"  Iterations: {max_iter}")
+        print(f"  Optimized parameters: {optimized_params}")
+        print("=" * 60)
+
         return {
             'optimized_params': optimized_params,
             'initial_params': initial_params,
-            'final_cost': result.fun,
-            'n_iterations': result.nit,
-            'success': result.success,
-            'message': result.message
+            'final_cost': float(best_cost),
+            'n_iterations': max_iter,
+            'max_iterations': max_iter,
+            'success': True,  # ADAM siempre completa las iteraciones
+            'message': 'ADAM optimization completed',
+            'cost_history': cost_history,
+            'optimizer': 'ADAM',
+            'n_trials': n_trials,
         }
 
     def _optimize_stage2(self, gsm_model, params):
         """
-        Stage 2: Fine-tune recurrent and additional network parameters.
+        Stage 2: Optimize using L-BFGS-B with deterministic ADF method.
 
-        Based on Eq. 25.
-        After Stage 1 has set the coarse recurrent structure
-        via parametric kernel (Eq. 10), Stage 2 expands the optimization
-        to include additional network parameters such as
-        feedforward gains, neuronal time constants,
-        and noise covariance terms.
+        Based on Echeveste et al. (2020) Methods section, page 18:
+        "In the second stage, we continued optimization using the L-BFGS-B
+        optimizer, now using the ADF method to (deterministically) compute
+        the moments of the network's response distribution. We kept the
+        cost-integration time window at its minimum (T_max - T_min = 50 ms,
+        as reached by the end of the first phase)."
 
-        Main paper, Eq. 25: loss = weighted sum of moment-matching penalties
-        (mean, variance, covariance, and slowness terms)
-        between network activity and the target GSM posterior statistics.
+        Key differences from Stage 1:
+        1. L-BFGS-B optimizer (quasi-Newton method)
+        2. Deterministic ADF method (no sampling, N_trial = None)
+        3. Fixed time window: T_min = T_max - 50ms
+        4. Can include slowness penalty cost (lambda_slow)
 
-        The optimization in Stage 2 uses a deterministic
-        moment-closure method (Assumed Density Filtering, Eqs. 17–20)
-        to compute network moments without sampling noise,
-        and employs the L-BFGS-B optimizer for stable convergence.
+        This stage optimizes network noise covariance parameters while
+        keeping connectivity parameters fixed from Stage 1.
 
         Parameters
         ----------
@@ -696,6 +893,11 @@ class Echeveste2020(SKNMSIMethodABC):
         -------
         dict
             Optimization results for Stage 2
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Nature Neuroscience, Methods page 18
+        .. [2] ssn_inference_optimizer/train.ml lines 249-278
         """
         from scipy.optimize import minimize
         from ._echeveste_training import compute_evolution_costs
@@ -711,6 +913,7 @@ class Echeveste2020(SKNMSIMethodABC):
         dt = params.get('dt', 0.2e-3)
         t_max = params.get('t_max', 0.1)
         t_subsamp = params.get('t_subsamp', 10.0e-3)
+        min_time = params.get('min_time', 0.05)  # 50ms evaluation window
         lambda_mean = params.get('lambda_mean', 1.0)
         lambda_var = params.get('lambda_var', 1.0)
         lambda_cov = params.get('lambda_cov', 1.0)
@@ -739,10 +942,10 @@ class Echeveste2020(SKNMSIMethodABC):
         )
 
         # Ajustar h_vec al tamaño de la red (mismo que Stage 1)
-        # Shape: (n_gsm_orientations,) -> recortar a (N_E + N_I,)
+        # Duplicar input para neuronas E e I (ver generalization.py:116)
         h_full = gsm_data['h_inputs'].mean(axis=0)
         h_e = h_full[:self._N_E]  # Primeras N_E para excitatorias
-        h_i = h_full[self._N_E:self._N_E + self._N_I]  # Siguientes N_I
+        h_i = h_e[:self._N_I]     # Duplicar para inhibitorias (mismo input)
         h_vec = jnp.concatenate([h_e, h_i])  # Shape: (N_E + N_I,)
 
         # Ajustar targets al tamaño de la red
@@ -801,7 +1004,8 @@ class Echeveste2020(SKNMSIMethodABC):
             noise_params['std_e'] = x[1]
             noise_params['std_i'] = x[2]
             # rho = 0.5 * (1 + tanh(x[3]))
-            noise_params['rho'] = 0.5 * (1.0 + np.tanh(x[3]))
+            # IMPORTANTE: Usar jnp.tanh para que sea diferenciable por JAX
+            noise_params['rho'] = 0.5 * (1.0 + jnp.tanh(x[3]))
             return noise_params
 
         def build_sigma_eta_jax(width, std_e, std_i, rho):
@@ -844,9 +1048,12 @@ class Echeveste2020(SKNMSIMethodABC):
             (-5.0, 5.0),           # rho_transformed ∈ (-∞, ∞)
         ]
 
-        # Función objetivo
-        def objective(x):
-            """Calcular costo para optimización de Σ_η."""
+        # Función objetivo con gradientes JAX
+        # Mismo patrón que Stage 1: gradientes analíticos son más precisos
+        import jax
+
+        def objective_jax(x):
+            """Calcular costo (versión JAX pura para autodiff)."""
             noise_params = unpack_noise_parameters(x)
 
             # Construir Σ_η con parámetros actuales
@@ -862,16 +1069,36 @@ class Echeveste2020(SKNMSIMethodABC):
                 jnp.array(W_fixed), h_vec, sigma_eta, inv_taus,
                 dt, self._integrator.f.tau_n, t_max, t_subsamp,
                 target_mu, target_sigma, self._integrator.f.k,
-                lambda_mean, lambda_var, lambda_cov
+                lambda_mean, lambda_var, lambda_cov, min_time
             )
 
-            return cost
+            # Manejar NaN/Inf
+            cost = jnp.where(
+                jnp.isfinite(cost),
+                cost,
+                1e10
+            )
+
+            return cost  # Mantener como JAX array para autodiff
+
+        # Calcular gradiente usando JAX
+        grad_fn = jax.grad(objective_jax)
+
+        def objective(x):
+            """Wrapper para scipy (retorna float)."""
+            return float(objective_jax(jnp.array(x)))
+
+        def gradient(x):
+            """Gradiente analítico usando JAX."""
+            g = grad_fn(jnp.array(x))
+            return np.array(g)
 
         # Optimización usando L-BFGS-B
         result = minimize(
             objective,
             x0,
             method='L-BFGS-B',
+            jac=gradient,  # Usar gradientes analíticos de JAX
             bounds=bounds,
             options={'maxiter': max_iter, 'disp': True}
         )
@@ -879,15 +1106,23 @@ class Echeveste2020(SKNMSIMethodABC):
         # Desempaquetar parámetros optimizados
         optimized_noise_params = unpack_noise_parameters(result.x)
 
-        # Construir y guardar matriz Σ_η final
-        self._Sigma_eta = self._build_noise_covariance(
-            optimized_noise_params['width'],
-            optimized_noise_params['std_e'],
-            optimized_noise_params['std_i'],
-            optimized_noise_params['rho']
-        )
+        # Solo actualizar matriz Σ_η si fue exitoso
+        if result.success:
+            self._Sigma_eta = self._build_noise_covariance(
+                optimized_noise_params['width'],
+                optimized_noise_params['std_e'],
+                optimized_noise_params['std_i'],
+                optimized_noise_params['rho']
+            )
 
-        print("\nStage 2 optimization completed:")
+        # NOTA: NO marcar _stage2_completed aquí, se marca en train()
+        # solo si result.success == True
+
+        print("\nStage 2 optimization finished:")
+        print(f"  Success: {result.success}")
+        print(f"  Final cost: {result.fun:.6f}")
+        print(f"  Iterations: {result.nit}/{max_iter}")
+        print(f"  Message: {result.message}")
         print(f"  width: {initial_noise_params['width']:.4f} → "
               f"{optimized_noise_params['width']:.4f}")
         print(f"  std_e: {initial_noise_params['std_e']:.4f} → "
@@ -900,11 +1135,16 @@ class Echeveste2020(SKNMSIMethodABC):
         return {
             'optimized_params': optimized_noise_params,
             'initial_params': initial_noise_params,
-            'final_cost': result.fun,
-            'n_iterations': result.nit,
-            'sigma_eta_shape': self._Sigma_eta.shape,
-            'success': result.success,
-            'message': result.message
+            'final_cost': float(result.fun),
+            'n_iterations': int(result.nit),
+            'max_iterations': max_iter,
+            'sigma_eta_shape': (
+                self._Sigma_eta.shape if result.success else None
+            ),
+            'success': bool(result.success),
+            'message': str(result.message),
+            'nfev': int(result.nfev),
+            'njev': int(result.njev) if hasattr(result, 'njev') else None
         }
 
     def _build_noise_covariance(self, width, std_e, std_i, rho):
@@ -1139,6 +1379,7 @@ class Echeveste2020(SKNMSIMethodABC):
 
         # Height parameters (amplitudes) a_XY
         # Transformación: a_XY = 0.01 + x²  => x = sqrt(a_XY - 0.01)
+        # Basado en objective.ml líneas 192
         for key in ['a_EE', 'a_EI', 'a_IE', 'a_II']:
             a = params_dict[key]
             if a <= 0.011:

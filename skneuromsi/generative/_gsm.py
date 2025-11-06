@@ -186,7 +186,7 @@ class GSM:
         spatial_freq=DEFAULT_SPATIAL_FREQ,
         bandwidth=DEFAULT_BANDWIDTH,
         alpha_h=1.96,
-        beta_h=0.10,
+        beta_h=0.10,  # Optimized value from Echeveste et al. (2020) Table S1
         gamma_h=2.03,
         correlation_strength=0.5,
         noise_variance=0.01,
@@ -214,9 +214,11 @@ class GSM:
         self.use_pretrained = use_pretrained
 
         # Nonlinearity parameters for SSN input h
-        self.alpha_h = alpha_h  # Input scaling
-        self.beta_h = beta_h  # Input baseline
-        self.gamma_h = gamma_h  # Input power
+        # Ref: Echeveste et al. 2020, ssn_inference_optimizer/objective.ml
+        # Formula: h = α_h · (β_h + filter_response)^γ_h
+        self.alpha_h = alpha_h  # α_h: Input scaling (multiplicador)
+        self.beta_h = beta_h    # β_h: Input baseline (offset)
+        self.gamma_h = gamma_h  # γ_h: Input power (exponente)
 
         # Initialize random state
         if random_seed is not None:
@@ -228,17 +230,29 @@ class GSM:
             self._load_pretrained_data()
         else:
             self._generate_new_data()
+            # Para _generate_new_data, necesitamos calcular patch_dim
+            self.patch_dim = self.patch_size * self.patch_size
+            self.orientation_dim = self.n_orientations
 
-        # Precompute W_ff AQUI, en el constructor.
-        A_concat = np.concatenate([self.A, self.A], axis=1)
-        self.W_ff = A_concat.T / 15.0
+        # Precompute W_ff según especificación del paper
+        # Ref: Echeveste et al. (2020) Supplementary Table S1, Input section:
+        # "Feed-forward weights: [A A]^T / 15.0"
+        # Para nuestro caso (solo población E): W_ff = A^T / 15.0
+        # Dimensiones:
+        # - A: (patch_dim, n_orientations) = (256, 50)
+        # - W_ff = A.T / 15: (n_orientations, patch_dim) = (50, 256)
+        # IMPORTANTE: El factor 1/15 es parte de W_ff, no se aplica después
+        self.W_ff = self.A.T / 15.0
+
+        # Verificar dimensiones
+        expected_wff_shape = (self.n_orientations, self.patch_dim)
+        assert self.W_ff.shape == expected_wff_shape, (
+            f"W_ff shape mismatch: expected {expected_wff_shape}, "
+            f"got {self.W_ff.shape}"
+        )
 
         # Precompute useful matrices
         self.ATA = self.A.T @ self.A
-
-        # Store dimensions
-        self.patch_dim = self.patch_size * self.patch_size
-        self.orientation_dim = self.n_orientations
 
     def _load_pretrained_data(self):
         """Load pre-trained Gabor filters and covariance matrix."""
@@ -315,18 +329,62 @@ class GSM:
         return {"x": x, "y": y, "z": contrast}
 
     def generate_h_input_efficient(self, x):
-        """
-        Efficient version assuming W_ff is precomputed.
+        """Generate SSN input h with trained nonlinearity.
 
-        based on Echeveste et al. (2020) eq. 14.
+        Implements the full nonlinear transformation trained in the model:
+        h = α_h · (β_h + W_ff @ x)^γ_h
+
+        Where W_ff = A.T / 15.0 according to Echeveste et al. (2020)
+        Supplementary Table S1.
+
+        Parameters:
+        - W_ff: Feed-forward weights = A.T / 15.0 (incluye h_scale)
+        - α_h (alpha_h): input scaling (multiplicador) - controls magnitude
+        - β_h (beta_h): input baseline (offset) - ensures positive argument
+        - γ_h (gamma_h): input power (exponente) - controls nonlinearity
+
+        This parameterization follows the original Echeveste code where
+        the scaling factor (1/15) is part of W_ff, making β_h values
+        moderate (~0.1) rather than large (~7 or ~103).
+
+        Reference: Echeveste et al. (2020) Supplementary Table S1
+                   ssn_inference_optimizer/objective.ml lines 410-413
+                   ssn_inference_numerical_experiments/GSM/GSM.py line 427
+
+        Parameters
+        ----------
+        x : numpy.ndarray
+            Image patch (flattened).
+
+        Returns
+        -------
+        numpy.ndarray
+            Input vector h for SSN.
         """
-        # Linear filtering
+        # Linear filtering: W_ff @ x donde W_ff = A.T / 15.0
+        # Ref: Echeveste et al. (2020) Supplementary Table S1:
+        # "Feed-forward weights: [A A]^T / 15.0"
+        # El factor 1/15 ya está incluido en W_ff
         filter_response = self.W_ff @ x
 
-        # Nonlinearity with optimized parameters
-        h = self.alpha_h * np.power(
-            self.beta_h + filter_response, self.gamma_h
-        )
+        # Nonlinearidad: h = α_h · (β_h + filter_response)^γ_h
+        # β_h garantiza que el argumento sea positivo
+        argument = self.beta_h + filter_response
+
+        # Validación: advertir si el argumento es negativo
+        min_arg = np.min(argument)
+        if min_arg < 0:
+            import warnings
+            warnings.warn(
+                f"Negative argument in h transformation: min={min_arg:.6f}. "
+                f"Consider increasing beta_h (current: {self.beta_h:.6f}). "
+                f"Clipping to small positive value.",
+                RuntimeWarning
+            )
+            # Clip a un valor pequeño positivo para evitar NaN
+            argument = np.maximum(argument, 1e-10)
+
+        h = self.alpha_h * np.power(argument, self.gamma_h)
 
         return h
 
@@ -385,8 +443,8 @@ class GSM:
                 all_stimuli[i, j] = stimulus_data["x"]
                 all_true_contrasts[i, j] = stimulus_data["z"]
 
-                # Generate SSN input h
-                h_input = self.generate_h_input(stimulus_data["x"])
+                # Generate SSN input h con transformación no lineal entrenada
+                h_input = self.generate_h_input_efficient(stimulus_data["x"])
                 all_h_inputs[i, j] = h_input
 
         return {
@@ -427,7 +485,7 @@ class GSM:
         h_samples = []
         for _ in range(n_samples):
             stimulus_data = self.generate_stimulus_patch(contrast)
-            h_input = self.generate_h_input(stimulus_data["x"])
+            h_input = self.generate_h_input_efficient(stimulus_data["x"])
             h_samples.append(h_input)
 
         return np.array(h_samples)
@@ -553,7 +611,7 @@ class GSM:
             all_mu.append(mu_post)
             all_Sigma.append(Sigma_post)
 
-            # Generar input h para SSN
+            # Generar input h para SSN con transformación no lineal entrenada
             h = self.generate_h_input_efficient(x)
             all_h.append(h)
 
@@ -567,6 +625,83 @@ class GSM:
             'h_inputs': np.array(all_h),
             'stimuli': np.array(all_x),
         }
+
+    def compute_input_baseline_lb(
+            self, stimuli=None, n_samples=100, contrasts=None):
+        """Compute lower bound for input baseline parameter.
+
+        Calculates the minimum filter response across stimuli to determine
+        a safe lower bound for the input baseline parameter β_h.
+        This ensures that β_h + filter_response > 0 for all data.
+
+        Following Echeveste et al. (2020) implementation:
+        input_baseline_lb = 0.1 - min(filter_response)
+
+        Parameters
+        ----------
+        stimuli : numpy.ndarray, optional
+            Pre-generated stimuli of shape (n_samples, patch_dim).
+            If None, generates new stimuli.
+        n_samples : int, optional
+            Number of samples to generate if stimuli is None. Default: 100.
+        contrasts : array_like, optional
+            Contrast levels to sample if generating new stimuli.
+            Default: [0.0, 0.125, 0.25, 0.5, 1.0, 2.0]
+
+        Returns
+        -------
+        float
+            Lower bound for input baseline parameter
+
+        References
+        ----------
+        .. [1] ssn_inference_optimizer/train.ml lines 47-49
+
+        Notes
+        -----
+        Este valor se usa durante el entrenamiento para parametrizar:
+        β_h = input_baseline_lb + x²
+        donde x es el parámetro optimizado.
+
+        La fórmula completa es: h = α_h · (β_h + filter)^γ_h
+        donde β_h debe ser suficientemente grande para evitar argumentos
+        negativos en la potencia.
+        """
+        if stimuli is None:
+            # Generar estímulos con diferentes contrastes
+            if contrasts is None:
+                contrasts = [0.0, 0.125, 0.25, 0.5, 1.0, 2.0]
+
+            stimuli = []
+            samples_per_contrast = n_samples // len(contrasts)
+
+            for contrast in contrasts:
+                for _ in range(samples_per_contrast):
+                    stim_data = self.generate_stimulus_patch(contrast)
+                    stimuli.append(stim_data['x'])
+
+            stimuli = np.array(stimuli)
+
+        # Calcular respuestas de filtros para todos los estímulos
+        # usando W_ff que ya incluye el factor de escala 1/15
+        # Ref: Echeveste et al. (2020) Supplementary Table S1:
+        # "Feed-forward weights: [A A]^T / 15.0"
+        filter_responses = []
+        for x in stimuli:
+            # W_ff @ x donde W_ff = A.T / 15.0
+            filter_response = self.W_ff @ x
+            filter_responses.append(filter_response)
+
+        filter_responses = np.array(filter_responses)
+
+        # Encontrar el mínimo global de las respuestas
+        min_filter = np.min(filter_responses)
+
+        # Calcular lower bound: garantiza que β_h + filter_response >= 0.1
+        # Con W_ff = A.T / 15.0, este valor será ~0.1 (moderado)
+        input_baseline_lb = 0.1 - min_filter
+
+        return input_baseline_lb
 
 
 # CONVENIENCE FUNCTIONS =======================================================

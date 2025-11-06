@@ -61,6 +61,7 @@ def plot_membrane_potentials(
     result,
     neuron_indices=None,
     population="both",
+    n_samples=5,
     figsize=(12, 6),
     title=None,
 ):
@@ -80,10 +81,13 @@ def plot_membrane_potentials(
     result : NDResult
         Result object from Echeveste2020.run() containing simulation data
     neuron_indices : list of int, optional
-        Indices of specific neurons to plot. If None, plots first 5 neurons
-        from each population
+        Indices of specific neurons to plot. If None, samples neurons
+        uniformly across the ring topology using n_samples
     population : {"excitatory", "inhibitory", "both"}
         Which population(s) to plot
+    n_samples : int, optional
+        Number of neurons to sample uniformly across the ring topology
+        (only used if neuron_indices is None). Default: 5
     figsize : tuple, optional
         Figure size (width, height) in inches
     title : str, optional
@@ -101,6 +105,9 @@ def plot_membrane_potentials(
     >>> ssn = Echeveste2020(N_E=50, N_I=50)
     >>> ssn.train()
     >>> result = ssn.run(stimulus_contrast=0.019, simulation_time=500.0)
+    >>> # Sample 10 neurons uniformly distributed
+    >>> fig, ax = plot_membrane_potentials(result, n_samples=10)
+    >>> # Or specify exact neuron indices
     >>> fig, ax = plot_membrane_potentials(result, neuron_indices=[0,1,2,3,4])
     """
     # Extraer potenciales de membrana u_α(t) del resultado
@@ -116,11 +123,13 @@ def plot_membrane_potentials(
 
     # Determinar índices de neuronas a graficar
     if neuron_indices is None:
-        # Por defecto: primeras 5 neuronas de cada población
-        n_exc = min(5, excitatory.shape[1])
-        n_inh = min(5, inhibitory.shape[1])
-        exc_indices = list(range(n_exc))
-        inh_indices = list(range(n_inh))
+        # Muestreo uniforme espaciado en lugar de primeras n neuronas
+        n_exc = excitatory.shape[1]
+        n_inh = inhibitory.shape[1]
+        n_samples_exc = min(n_samples, n_exc)
+        n_samples_inh = min(n_samples, n_inh)
+        exc_indices = np.linspace(0, n_exc-1, n_samples_exc, dtype=int)
+        inh_indices = np.linspace(0, n_inh-1, n_samples_inh, dtype=int)
     else:
         exc_indices = neuron_indices
         inh_indices = neuron_indices
