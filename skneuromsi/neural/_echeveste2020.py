@@ -346,7 +346,8 @@ class Echeveste2020(SKNMSIMethodABC):
             - Trained parameters from natural image statistics
         stage1_params: dict, optional
             Parameters specific to Stage 1 (ADAM) optimization:
-            - max_iter: number of ADAM iterations (default: 250)
+            - max_iter: number of ADAM iterations
+                (default: 250, recommendation max_iter >= 50)
             - n_trials: number of samples per iteration (default: 50)
             - eta: ADAM learning rate (default: 0.002)
             - beta1, beta2: ADAM momentum parameters

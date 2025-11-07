@@ -186,7 +186,7 @@ class GSM:
         spatial_freq=DEFAULT_SPATIAL_FREQ,
         bandwidth=DEFAULT_BANDWIDTH,
         alpha_h=1.96,
-        beta_h=0.10,  # Optimized value from Echeveste et al. (2020) Table S1
+        beta_h=1.9,  # Baseline from Echeveste et al. (2020) Table S1
         gamma_h=2.03,
         correlation_strength=0.5,
         noise_variance=0.01,
@@ -332,7 +332,7 @@ class GSM:
         """Generate SSN input h with trained nonlinearity.
 
         Implements the full nonlinear transformation trained in the model:
-        h = α_h · (β_h + W_ff @ x)^γ_h
+        h = α_h · max(W_ff @ x + β_h, 0)^γ_h
 
         Where W_ff = A.T / 15.0 according to Echeveste et al. (2020)
         Supplementary Table S1.
@@ -340,16 +340,16 @@ class GSM:
         Parameters:
         - W_ff: Feed-forward weights = A.T / 15.0 (incluye h_scale)
         - α_h (alpha_h): input scaling (multiplicador) - controls magnitude
-        - β_h (beta_h): input baseline (offset) - ensures positive argument
+        - β_h (beta_h): input baseline (offset) - baseline before ReLU
         - γ_h (gamma_h): input power (exponente) - controls nonlinearity
+        - max(·, 0): ReLU threshold - ensures non-negative values
 
-        This parameterization follows the original Echeveste code where
-        the scaling factor (1/15) is part of W_ff, making β_h values
-        moderate (~0.1) rather than large (~7 or ~103).
+        IMPORTANT: The threshold ReLU is applied AFTER adding the
+        baseline β_h, as per the original implementation.
 
         Reference: Echeveste et al. (2020) Supplementary Table S1
+                   transformed_moments_nonlinearity.py lines 27-28
                    ssn_inference_optimizer/objective.ml lines 410-413
-                   ssn_inference_numerical_experiments/GSM/GSM.py line 427
 
         Parameters
         ----------
@@ -367,24 +367,18 @@ class GSM:
         # El factor 1/15 ya está incluido en W_ff
         filter_response = self.W_ff @ x
 
-        # Nonlinearidad: h = α_h · (β_h + filter_response)^γ_h
-        # β_h garantiza que el argumento sea positivo
-        argument = self.beta_h + filter_response
+        # Nonlinearidad con threshold ReLU:
+        # h = α_h · max(filter_response + β_h, 0)^γ_h
+        # Ref: transformed_moments_nonlinearity.py línea 27-28:
+        # nl_fun(u, nl_scale, nl_baseline, nl_power) =
+        #     nl_scale * (np.maximum(u + nl_baseline, 0) ** nl_power)
+        argument = filter_response + self.beta_h
 
-        # Validación: advertir si el argumento es negativo
-        min_arg = np.min(argument)
-        if min_arg < 0:
-            import warnings
-            warnings.warn(
-                f"Negative argument in h transformation: min={min_arg:.6f}. "
-                f"Consider increasing beta_h (current: {self.beta_h:.6f}). "
-                f"Clipping to small positive value.",
-                RuntimeWarning
-            )
-            # Clip a un valor pequeño positivo para evitar NaN
-            argument = np.maximum(argument, 1e-10)
+        # Aplicar threshold ReLU: max(argument, 0)
+        argument_rectified = np.maximum(argument, 0.0)
 
-        h = self.alpha_h * np.power(argument, self.gamma_h)
+        # Aplicar potencia y escala
+        h = self.alpha_h * np.power(argument_rectified, self.gamma_h)
 
         return h
 
