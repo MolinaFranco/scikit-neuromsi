@@ -850,11 +850,326 @@ def compute_cost_components(
     return cost_mean, cost_var, cost_cov
 
 
+# =============================================================================
+# Temporal weighting utilities
+# =============================================================================
+
+def create_temporal_weighting(n_time_bins, min_time_bins, zero_up_to=None):
+    """
+    Create temporal weighting vector for cost evaluation.
+
+    JUSTIFICACIÓN MATEMÁTICA
+    -------------------------
+    El temporal weighting permite controlar qué timesteps contribuyen
+    al costo durante el entrenamiento. Esto es CRUCIAL para:
+
+    1. TRANSIENT FILTERING: Ignorar timesteps tempranos donde la red
+       todavía está estabilizándose.
+
+    2. TEMPORAL ANNEALING: Durante entrenamiento con ADAM, permite
+       expandir progresivamente la ventana temporal evaluada.
+
+    CÓDIGO ORIGINAL: objective.ml lines 374-375, train.ml lines 240-243
+    - objective.ml:374: step_fun define pesos 0/1
+    - train.ml:240-243: update_temporal_weighting actualiza ventana
+
+    PAPER: Echeveste et al. (2020) Methods, página 18:
+    "the beginning of the averaging time window, T_min in Eqs. 26-28,
+    was systematically changed ('annealed') from T_min = 0 ms to
+    T_max - 50 ms"
+
+    Esta estrategia permite que:
+    - Inicialmente: La red aprende el comportamiento asintótico
+      (últimos 50ms) que es más estable y fácil de optimizar
+    - Gradualmente: Se incluyen timesteps más tempranos, forzando
+      a la red a refinar su dinámica transitoria
+
+    Parameters
+    ----------
+    n_time_bins : int
+        Total number of time bins
+    min_time_bins : int
+        Minimum number of bins at the end that always have weight 1.0
+    zero_up_to : int or None
+        Number of initial bins with weight 0.0
+        If None, uses (n_time_bins - min_time_bins), meaning only
+        the last min_time_bins have weight 1.0
+
+    Returns
+    -------
+    temporal_weighting : np.ndarray, shape (n_time_bins,)
+        Weight vector: 0.0 before zero_up_to, 1.0 after
+
+    Notes
+    -----
+    Ref: objective.ml line 374-375
+    let step_fun i = if i<(n_time_bins - min_time_bins) then 0. else 1.
+    let temporal_weighting = Vec.init n_time_bins (fun i -> step_fun i)
+    """
+    import numpy as np
+
+    if zero_up_to is None:
+        # Por defecto: solo últimos min_time_bins tienen peso 1.0
+        zero_up_to = n_time_bins - min_time_bins
+
+    # Crear vector de pesos
+    # Ref: objective.ml line 374
+    temporal_weighting = np.where(
+        np.arange(n_time_bins) < zero_up_to,
+        0.0,
+        1.0
+    )
+
+    return temporal_weighting
+
+
+@jax.jit
+def compute_slowness_cost(w, mu, sigma, inv_taus, dt, t_max_slow,
+                          k, lambda_slow):
+    """
+    Compute slowness penalty cost.
+
+    JUSTIFICACIÓN MATEMÁTICA
+    -------------------------
+    El slowness penalty penaliza cambios rápidos en la covarianza Σ
+    durante la dinámica transitoria del sistema. Esto ayuda a prevenir
+    oscilaciones no deseadas y fuerza una dinámica más suave.
+
+    Paper Echeveste et al. (2020): No mencionado explícitamente en paper
+    principal, pero usado en código original para estabilizar training.
+
+    ECUACIÓN DE SLOWNESS:
+    ---------------------
+    La covarianza Σ evoluciona (aproximadamente) según:
+        dΣ/dt ≈ Σ·J^T + J·Σ
+
+    donde J es el Jacobiano del sistema linealizado.
+
+    El costo de slowness mide cuánto cambia Σ durante la dinámica:
+
+    L_slow = λ_slow · Σ_{t=0}^{T_slow} ||Σ_norm(t)||²
+
+    donde Σ_norm(t) = diag(Σ(t)) / diag(Σ_final)
+
+    ALGORITMO (objective.ml:437-452):
+    ----------------------------------
+    1. Calcular γ = ∂E[r]/∂μ para estado steady-state (μ, Σ)
+    2. Construir Jacobiano J = diag(1/τ) · (W·diag(γ) - I)
+    3. Inicializar S = Σ (covarianza final/steady-state)
+    4. Iterar hacia atrás en el tiempo:
+        a. Normalizar diagonal: S_norm_ii = S_ii / Σ_ii
+        b. Acumular costo: cost += ||S_norm||²
+        c. Evolucionar S: S ← S + dt·(S @ J^T)
+    5. Retornar λ_slow · cost
+
+    INTERPRETACIÓN:
+    ---------------
+    - Si la red tiene oscilaciones grandes durante transitorios,
+      Σ(t) variará mucho y el costo será alto
+    - Penalizando esto, forzamos dinámica más estable y predecible
+    - Útil principalmente en Stage 2 para refinar parámetros de ruido
+
+    CÓDIGO ORIGINAL: objective.ml lines 437-452
+    - Line 440-442: Calcular gamma vector
+    - Line 443: Construir Jacobiano j_mat
+    - Line 444-452: Iterar evolución de covarianza
+
+    Parameters
+    ----------
+    w : jax.Array, shape (N, N)
+        Connectivity matrix W
+    mu : jax.Array, shape (N,)
+        Mean vector at steady-state (from ADF evolution)
+    sigma : jax.Array, shape (N, N)
+        Covariance matrix at steady-state (from ADF evolution)
+    inv_taus : jax.Array, shape (N,)
+        Inverse time constants 1/τ_α
+    dt : float
+        Time step for slowness integration (seconds)
+    t_max_slow : float
+        Maximum time for slowness integration (seconds)
+        Typically same as t_max for main evolution
+    k : float
+        Supralinear scaling constant (default 0.3)
+    lambda_slow : float
+        Slowness penalty weight (default 0, can use 0.1)
+        Already normalized by system size
+
+    Returns
+    -------
+    cost_slow : float
+        Slowness penalty cost
+
+    Notes
+    -----
+    - Esta función se llama SOLO en Stage 2 (L-BFGS con ADF)
+    - En Stage 1 (ADAM con samples), lambda_slow = 0
+    - Default lambda_slow = 0, pero puede ser ~0.1 para estabilidad
+    - El costo se normaliza por (2 * N * n_time_bins_slow * n_targets)
+      antes de multiplicar por lambda_slow (ver objective.ml:113)
+
+    References
+    ----------
+    .. [1] ssn_inference_optimizer/objective.ml lines 437-452
+    .. [2] ssn_inference_optimizer/objective.ml line 113 (normalization)
+    """
+    # PASO 1: Calcular momentos no lineales γ = ∂E[r]/∂μ
+    # Necesitamos γ para construir el Jacobiano
+    # Ref: objective.ml:440-442
+    _, gamma = compute_nonlinear_moments(mu, sigma, k)
+
+    # PASO 2: Construir Jacobiano J = diag(1/τ) · (W·diag(γ) - I)
+    # Este Jacobiano controla cómo evoluciona la covarianza
+    # Ref: objective.ml:443
+    j_mat = compute_jacobian_matrix(w, gamma, inv_taus)
+
+    # PASO 3: Normalizar lambda_slow por tamaño del sistema
+    # Ref: objective.ml:113
+    # lambda_slow /= (2 * N * n_time_bins_slow * n_targets)
+    N = len(mu)
+    n_time_bins_slow = int(t_max_slow / dt)
+    n_targets = 1  # Típicamente 1 target
+    lambda_slow_norm = lambda_slow / (2.0 * N * n_time_bins_slow * n_targets)
+
+    # PASO 4: Extraer diagonal de Σ para normalización
+    # Usaremos esto para normalizar S en cada paso
+    sigma_diag = jnp.diag(sigma)  # Shape: (N,)
+
+    # PASO 5: Iterar evolución de covarianza hacia atrás
+    # Ref: objective.ml:444-452
+    def iterate_step(carry, t):
+        """
+        Single iteration step for slowness cost.
+
+        carry: (S_current, cost_accumulated)
+        t: timestep index
+        """
+        s_current, cost_accu = carry
+
+        # a. Normalizar diagonal de S por diagonal de Σ
+        # s_norm_ii = S_ii / Σ_ii
+        # Ref: objective.ml:447
+        s_diag = jnp.diag(s_current)  # Shape: (N,)
+        s_norm_diag = s_diag / (sigma_diag + 1e-10)  # Evitar div/0
+
+        # b. Acumular costo: ||s_norm_diag||²
+        # Ref: objective.ml:448
+        cost_step = jnp.sum(s_norm_diag ** 2)
+        cost_accu = cost_accu + cost_step
+
+        # c. Evolucionar S: dS/dt = S @ J^T
+        # Discretización: S_new = S + dt·(S @ J^T)
+        # Ref: objective.ml:449
+        ds_dt = jnp.dot(s_current, j_mat.T)
+        s_new = s_current + dt * ds_dt
+
+        return (s_new, cost_accu), None
+
+    # PASO 6: Inicializar con Σ (steady-state) e iterar
+    # Ref: objective.ml:452
+    s_init = sigma
+    cost_init = 0.0
+
+    # Iterar n_time_bins_slow pasos
+    # Ref: objective.ml:444-451 (función recursiva iterate)
+    (s_final, total_cost), _ = jax.lax.scan(
+        iterate_step,
+        (s_init, cost_init),
+        jnp.arange(n_time_bins_slow)
+    )
+
+    # PASO 7: Aplicar lambda_slow normalizado
+    # Ref: objective.ml:445
+    return lambda_slow_norm * total_cost
+
+
+def update_temporal_weighting(temporal_weighting, n_time_bins, min_time_bins,
+                              iteration, max_iterations=200,
+                              no_progression=False):
+    """
+    Update temporal weighting for annealing during ADAM training.
+
+    JUSTIFICACIÓN MATEMÁTICA
+    -------------------------
+    Durante el entrenamiento con ADAM (sample-based), se actualiza
+    progresivamente la ventana temporal para implementar annealing.
+
+    ALGORITMO (train.ml lines 240-243):
+    ------------------------------------
+    zero_up_to = min(n_time_bins - min_time_bins,
+                     round(n_time_bins * iteration / max_iterations))
+
+    for i in 1..n_time_bins:
+        temporal_weighting[i] = 0.0 if i < zero_up_to else 1.0
+
+    PROGRESIÓN:
+    - iteration=0: zero_up_to ≈ n_time_bins - min_time_bins
+      → Solo últimos min_time_bins evaluados
+    - iteration=100: zero_up_to ≈ n_time_bins/2
+      → Segunda mitad evaluada
+    - iteration=200: zero_up_to = 0
+      → Todos los bins evaluados
+
+    PAPER: Echeveste et al. (2020) Methods, página 18:
+    "the beginning of the averaging time window, T_min in Eqs. 26-28,
+    was systematically changed ('annealed') from T_min = 0 ms to
+    T_max - 50 ms during the initial 200 iterations"
+
+    Parameters
+    ----------
+    temporal_weighting : np.ndarray, shape (n_time_bins,)
+        Current temporal weighting vector (modified in-place)
+    n_time_bins : int
+        Total number of time bins
+    min_time_bins : int
+        Minimum number of bins at the end that always have weight 1.0
+    iteration : int
+        Current training iteration
+    max_iterations : int
+        Maximum iterations for annealing (default 200, from OCaml code)
+    no_progression : bool
+        If True, skip annealing and use final weighting immediately
+        Ref: train.ml line 242: check "-no_progression"
+
+    Returns
+    -------
+    None
+        Modifies temporal_weighting in-place
+
+    Notes
+    -----
+    Ref: train.ml lines 240-243
+    let update_temporal_weighting iter =
+      let zero_up_to = min (X.n_time_bins - X.min_time_bins)
+        (if Cmdargs.check "-no_progression" then max_int
+         else round (float n_time_bins *. float iter /. 200.)) in
+      for i=1 to X.n_time_bins do
+        X.Samples.temporal_weighting.{i} <- if i<zero_up_to then 0.
+                                            else 1. done
+    """
+    if no_progression:
+        # Sin progresión: ir directo al final (todos bins = 1.0)
+        zero_up_to = 0
+    else:
+        # Con progresión: expandir gradualmente la ventana
+        # Ref: train.ml line 241-242
+        progression = int(
+            round(n_time_bins * iteration / max_iterations)
+        )
+        zero_up_to = min(n_time_bins - min_time_bins, progression)
+
+    # Actualizar vector in-place
+    # Ref: train.ml line 243
+    for i in range(n_time_bins):
+        temporal_weighting[i] = 0.0 if i < zero_up_to else 1.0
+
+
 def compute_evolution_costs(
     w, h, sigma_eta, inv_taus, dt, tau_eta, t_max, t_subsamp,
     target_mu, target_sigma, k=0.3,
     lambda_mean=1.0, lambda_var=1.0, lambda_cov=1.0,
-    min_time=0.05
+    lambda_slow=0.0,
+    min_time=0.05, temporal_weighting=None
 ):
     """
     Compute cost over entire time evolution using ADF.
@@ -880,6 +1195,25 @@ def compute_evolution_costs(
        transitoria. Queremos capturar el comportamiento realista después
        de que la red se "asienta" (después de min_time).
 
+    TEMPORAL WEIGHTING:
+    -------------------
+    El parámetro temporal_weighting permite ponderar diferentes timesteps
+    en el cálculo del costo. Esto es CRUCIAL para:
+
+    1. TRANSIENT FILTERING: Ignorar timesteps tempranos donde la red
+       todavía está estabilizándose (wt=0 para t < t_max - min_time)
+
+    2. TEMPORAL ANNEALING: Durante el entrenamiento con ADAM, se puede
+       aumentar progresivamente la ventana temporal evaluada, permitiendo
+       que la red primero aprenda el comportamiento asintótico y luego
+       refine la dinámica transitoria.
+
+    CÓDIGO ORIGINAL: objective.ml lines 374-400
+    - Line 374: step_fun define pesos 0/1 según min_time
+    - Line 375: temporal_weighting vector con pesos por timestep
+    - Line 394: wt = temporal_weighting[t] multiplica cada costo
+    - train.ml lines 240-243: update_temporal_weighting para annealing
+
     ALGORITMO:
     -----------
     1. Inicializar μ = 0, Σ = 4I, Σ* = 4I (condiciones iniciales)
@@ -888,9 +1222,10 @@ def compute_evolution_costs(
 
     2. Loop temporal desde t=0 hasta t=t_max:
        a. Evolucionar (μ, Σ, Σ*) un paso dt usando ADF (Eqs. 17-19)
-       b. Si t >= (t_max - min_time) y t es múltiplo de t_subsamp:
+       b. Si t es múltiplo de t_subsamp:
           - Extraer solo neuronas excitatorias (primeras m)
           - Calcular costo comparando con targets del GSM
+          - Multiplicar por temporal_weighting[t]
           - Acumular costo
 
     3. Retornar costo total acumulado
@@ -911,7 +1246,7 @@ def compute_evolution_costs(
 
     CÓDIGO ORIGINAL: objective.ml lines 377-408
     - Lines 379-391: loop temporal con evolución de momentos
-    - Lines 393-400: acumulación de costo (solo después de min_time)
+    - Lines 393-400: acumulación de costo con temporal weighting
     - Lines 404-407: condiciones iniciales
 
     Parameters
@@ -944,13 +1279,23 @@ def compute_evolution_costs(
         Weight λ_σ² for variance matching (default 1.0)
     lambda_cov : float
         Weight λ_Σ for covariance matching (default 1.0)
+    lambda_slow : float
+        Weight λ_slow for slowness penalty (default 0.0)
+        Ref: objective.ml:437-452, train.ml:39
+        If > 0, penalizes rapid changes in covariance during dynamics
+        Typical value: 0.1 for Stage 2 stability
     min_time : float
         Evaluation window at end (seconds, default 0.05s = 50ms)
+    temporal_weighting : jax.Array or None
+        Temporal weighting vector, shape (n_time_bins,)
+        If None, uses step function: 0 before min_time, 1 after
+        Ref: objective.ml lines 374-375
 
     Returns
     -------
     total_cost : float
-        Total accumulated cost L = Σ_t [mean_cost + var_cost + cov_cost]
+        Total accumulated cost L = Σ_t [wt * (mean_cost + var_cost +
+        cov_cost)]
     mu_final : jax.Array
         Final mean state μ(t_max), shape (n,)
     sigma_final : jax.Array
@@ -987,6 +1332,20 @@ def compute_evolution_costs(
     subsamp_bins = int(t_subsamp / dt)  # Intervalo entre evaluaciones
     min_time_bins = int(min_time / dt)  # Bins en ventana evaluación
 
+    # PASO 1b: Crear temporal_weighting si no se provee
+    # Ref: objective.ml line 374-375
+    # step_fun i = if i<(n_time_bins - min_time_bins) then 0. else 1.
+    if temporal_weighting is None:
+        # Peso 0.0 para timesteps antes de min_time
+        # Peso 1.0 para timesteps después de min_time
+        temporal_weighting = jnp.where(
+            jnp.arange(n_time_bins) < (n_time_bins - min_time_bins),
+            0.0,
+            1.0
+        )
+    else:
+        temporal_weighting = jnp.asarray(temporal_weighting)
+
     # PASO 2: Condiciones iniciales de los momentos
     # Valores estándar del código original (objective.ml lines 404-407)
     # μ(0) = 0: red comienza en reposo (sin actividad)
@@ -1017,14 +1376,17 @@ def compute_evolution_costs(
         )
 
         # SUB-PASO 4b: Evaluar y acumular costo (condicionalmente)
-        # Condición 1: t >= (n_time_bins - min_time_bins)
-        #   → Solo en últimos min_time segundos (ventana de evaluación)
-        #   → Evita transientes iniciales cuando red se estabiliza
-        # Condición 2: t % subsamp_bins == 0
+        # Condición: t % subsamp_bins == 0
         #   → Solo cada t_subsamp segundos (subsampling)
         #   → Reduce costo computacional sin perder información
         # objective.ml lines 393-400
-        if t >= (n_time_bins - min_time_bins) and t % subsamp_bins == 0:
+        if t % subsamp_bins == 0:
+            # Obtener peso temporal para este timestep
+            # wt = 0.0 si estamos en transiente inicial
+            # wt = 1.0 si estamos en ventana de evaluación
+            # Ref: objective.ml line 394
+            wt = temporal_weighting[t]
+
             # Extraer solo neuronas EXCITATORIAS (primeras m)
             # Las I neurons (últimas n-m) no se usan para costo
             # porque GSM solo provee targets para orientaciones (E)
@@ -1038,16 +1400,26 @@ def compute_evolution_costs(
                 lambda_mean, lambda_var, lambda_cov
             )
 
-            # Acumular costos para este timestep
-            # El costo total será la suma sobre todos los timesteps evaluados
-            accu_mean += c_mean
-            accu_var += c_var
-            accu_cov += c_cov
+            # Acumular costos para este timestep MULTIPLICADOS POR wt
+            # El costo total será la suma ponderada sobre timesteps
+            # Ref: objective.ml line 399
+            accu_mean += wt * c_mean
+            accu_var += wt * c_var
+            accu_cov += wt * c_cov
 
-    # PASO 5: Calcular costo total
-    # L = Σ_t [L_mean(t) + L_var(t) + L_cov(t)]
-    # Este es el escalar que se minimiza durante optimización
+    # PASO 5: Calcular costo total (matching terms)
+    # L_match = Σ_t [L_mean(t) + L_var(t) + L_cov(t)]
     total_cost = accu_mean + accu_var + accu_cov
+
+    # PASO 5b: Agregar slowness penalty si lambda_slow > 0
+    # Ref: objective.ml:464-466, line 473
+    # El slowness cost penaliza cambios rápidos en Σ durante dinámica
+    # Solo se usa en Stage 2 (L-BFGS) con lambda_slow típicamente 0.1
+    if lambda_slow > 0:
+        cost_slow = compute_slowness_cost(
+            w, mu, sigma, inv_taus, dt, t_max, k, lambda_slow
+        )
+        total_cost = total_cost + cost_slow
 
     # PASO 6: Retornar costo y estados finales
     # - total_cost: usado por optimizador (JAX array, no convertir a float)
@@ -1317,10 +1689,13 @@ def create_objective_function(
         theta = jnp.linspace(0, jnp.pi, N_E, endpoint=False)
 
         # Función auxiliar para construir bloques
+        # Ref: objective.ml lines 285-287
+        # Formula: W_XY(θi, θj) = s * a * exp[(cos(θi - θj) - 1) / d²]
+        # IMPORTANTE: SIN factor 2 en el coseno (ver Equation 10 del paper)
         def connectivity_block(theta_pre, theta_post, a, d, sign):
             delta = theta_pre[:, None] - theta_post[None, :]
             return sign * a * jnp.exp(
-                (jnp.cos(2 * delta) - 1) / (d**2)
+                (jnp.cos(delta) - 1) / (d**2)
             )
 
         # Construir bloques
@@ -1632,7 +2007,8 @@ def simulate_ssn_with_noise(w, h_vec, sigma_eta, inv_taus, dt,
 def compute_costs_with_samples(w, h_vec, sigma_eta, inv_taus, dt,
                                tau_eta, t_max, t_subsamp, target_mu,
                                target_sigma, k, lambda_mean, lambda_var,
-                               lambda_cov, min_time, n_trials, key):
+                               lambda_cov, min_time, n_trials, key,
+                               temporal_weighting=None):
     """
     Compute costs using sample-based stochastic optimization.
 
@@ -1640,18 +2016,51 @@ def compute_costs_with_samples(w, h_vec, sigma_eta, inv_taus, dt,
     Echeveste et al. (2020), where N_trial = 50 trials are simulated
     with process noise to estimate network response moments.
 
+    CRITICAL DIFFERENCES FROM ADF:
+    -------------------------------
+    1. Simula N_trial trayectorias estocásticas completas
+    2. Computa momentos empíricos across trials EN CADA TIMESTEP
+    3. Acumula costos timestep-por-timestep con temporal_weighting
+    4. Momentos de u (membrane potentials), NO de r (firing rates)
+
+    ALGORITMO (siguiendo objective.ml:530-556):
+    --------------------------------------------
+    1. Inicializar u0 ~ N(0, 4I) para n_trials (objetivo.ml:554)
+    2. Para t = 0 hasta n_time_bins:
+       a. Actualizar u para todos los trials en paralelo
+       b. Si t es múltiplo de subsamp_bins:
+          - Calcular mu = mean(u) across trials (objective.ml:541)
+          - Calcular sigma = cov(u) across trials (objective.ml:542-543)
+          - Obtener wt = temporal_weighting[t] (objective.ml:545)
+          - Acumular costos: accu += wt * costs (objective.ml:549)
+    3. Retornar costos acumulados
+
+    TEMPORAL WEIGHTING & ANNEALING:
+    --------------------------------
+    Durante el entrenamiento con ADAM (sample-based), se utiliza
+    temporal weighting que se actualiza progresivamente (annealing):
+
+    - Inicialmente: Solo se evalúan costos en últimos 50ms
+    - Gradualmente: Se expande la ventana hacia atrás
+    - Finalmente (iter=200): Se evalúan todos los timesteps desde t=0
+
+    Esto facilita el entrenamiento porque:
+    1. Comportamiento asintótico es más estable y fácil de aprender
+    2. Dinámica transitoria es más compleja y se refina después
+
+    CÓDIGO ORIGINAL: objective.ml lines 530-556
+    - Line 541-543: Momentos across trials en cada timestep
+    - Line 544-549: Aplicar temporal_weighting y acumular costos
+    - Line 554: u0 inicializado con gaussian_noise(2.0)
+
     Based on Echeveste et al. (2020) Methods section, page 18:
     "During the first stage, we employed a stochastic gradient method
     using N_trial = 50 trials for each training stimulus to estimate the
     corresponding moments of network responses"
 
-    The algorithm:
-    1. For each trial k = 1..N_trial:
-       - Sample initial conditions from N(μ0, Σ0)
-       - Simulate SSN dynamics (Eq. 8) with process noise
-       - Collect firing rates during evaluation window [T_min, T_max]
-    2. Compute empirical moments across trials
-    3. Match empirical moments to GSM posterior targets (Eq. 25)
+    "the beginning of the averaging time window, T_min in Eqs. 26-28,
+    was systematically changed ('annealed') from T_min = 0 ms to
+    T_max - 50 ms during the initial 200 iterations"
 
     Parameters
     ----------
@@ -1684,73 +2093,54 @@ def compute_costs_with_samples(w, h_vec, sigma_eta, inv_taus, dt,
     lambda_cov : float
         Weight for covariance matching term
     min_time : float
-        Start of evaluation window (T_min, seconds)
+        Start of evaluation window (T_min, seconds) - NOT USED HERE
+        (temporal_weighting handles this instead)
     n_trials : int
         Number of stochastic trials (typically 50)
     key : jax.random.PRNGKey
         Random key for reproducibility
+    temporal_weighting : np.ndarray or None
+        Temporal weighting vector, shape (n_time_bins,)
+        If None, uses all 1.0 (evaluate all timesteps equally)
+        During ADAM training, this vector is updated progressively
+        to implement temporal annealing
+        Ref: objective.ml line 528, 545, train.ml lines 240-243, 286
 
     Returns
     -------
     cost : float
-        Total cost averaged over trials
+        Total cost averaged over time with temporal weighting
     mu_empirical : jax.Array, shape (N_E,)
-        Empirical mean of firing rates
+        Empirical mean of membrane potentials (last timestep)
     sigma_empirical : jax.Array, shape (N_E, N_E)
-        Empirical covariance of firing rates
+        Empirical covariance of membrane potentials (last timestep)
 
     References
     ----------
     .. [1] Echeveste et al. (2020) Nature Neuroscience, Methods page 18
-    .. [2] ssn_inference_optimizer/objective.ml lines 517-580
+    .. [2] ssn_inference_optimizer/objective.ml lines 530-556
+    .. [3] ssn_inference_optimizer/train.ml lines 240-243 (annealing)
     """
+    import numpy as np
+
+    N = len(h_vec)
     N_E = len(target_mu)  # Número de neuronas excitatorias
+    n_time_bins = int(t_max / dt)
+    subsamp_bins = int(t_subsamp / dt)
 
-    # Índices de tiempo para evaluación
-    # Paper: "the beginning of the averaging time window, T_min in Eqs. 26-28,
-    # was systematically changed ('annealed') from T_min = 0 ms to
-    # T_max - 50 ms"
-    t_min_idx = int(min_time / dt)
+    # Default temporal weighting (todos los timesteps con peso 1.0)
+    # Ref: objective.ml line 528
+    if temporal_weighting is None:
+        temporal_weighting = np.ones(n_time_bins)
 
-    def simulate_trial(key_trial):
-        """Simulate one trial and compute moments."""
-        # Simular dinámica con ruido
-        u_traj, r_traj = simulate_ssn_with_noise(
-            w, h_vec, sigma_eta, inv_taus, dt, tau_eta, t_max, k, key_trial
-        )
-
-        # Submuestrear tasas de disparo en ventana de evaluación
-        # Paper: "we sub-sampled them every t_subsamp = 10 ms"
-        subsamp_factor = int(t_subsamp / dt)
-        r_eval = r_traj[t_min_idx::subsamp_factor, :N_E]  # Solo excitatorias
-
-        # Promedio temporal para este trial
-        # Shape: (N_E,)
-        r_mean_trial = r_eval.mean(axis=0)
-
-        return r_mean_trial, r_eval
-
-    # Simular N_trial trials
-    keys = jax.random.split(key, n_trials)
-    r_means, r_evals = jax.vmap(simulate_trial)(keys)
-
-    # Calcular momentos empíricos across trials
-    # Paper: "estimate the corresponding moments of network responses"
-    mu_empirical = r_means.mean(axis=0)  # Shape: (N_E,)
-
-    # Covarianza empírica
-    # Cov[r_i, r_j] = E[(r_i - E[r_i])(r_j - E[r_j])]
-    r_centered = r_means - mu_empirical[None, :]
-    sigma_empirical = (r_centered.T @ r_centered) / n_trials
+    # IMPORTANT: Convert temporal_weighting to JAX array for indexing
+    # inside scan. This avoids TracerArrayConversionError when indexing
+    # with JAX tracer
+    temporal_weighting = jnp.array(temporal_weighting)
 
     # Normalizar lambdas por tamaño del sistema
     # Ref: objective.ml:110-113
     # "give the multipliers their natural scaling with system size"
-    #
-    # Esto es CRÍTICO para que los costos estén en la escala correcta.
-    # Sin esta normalización, los costos son ~500-1000× más grandes.
-    n_time_bins = int(t_max / dt)
-    subsamp_bins = int(t_subsamp / dt)
     n_subsamp_bins = n_time_bins // subsamp_bins
     n_targets = 1  # Típicamente 1 target
 
@@ -1760,26 +2150,133 @@ def compute_costs_with_samples(w, h_vec, sigma_eta, inv_taus, dt,
         2.0 * N_E * N_E * n_targets * n_subsamp_bins
     )
 
-    # Función de costo (Eq. 25)
-    # L = λ_μ·||μ - μ_target||² + λ_σ·||diag(Σ) - diag(Σ_target)||²
-    #     + λ_Σ·||Σ - Σ_target||²_F
+    # Inicialización de Cholesky para ruido
+    L_eta = jnp.linalg.cholesky(sigma_eta)
 
-    # Target variance (diagonal de target_sigma)
-    target_var = jnp.diag(target_sigma)
-    empirical_var = jnp.diag(sigma_empirical)
+    # Parámetros de ruido OU
+    alpha_eta = jnp.exp(-dt / tau_eta)
+    beta_eta_scale = jnp.sqrt(1 - alpha_eta**2)
 
-    # Costo de media (con lambda normalizada)
-    cost_mean = lambda_mean_norm * jnp.sum((mu_empirical - target_mu)**2)
+    # Inicializar condiciones iniciales para todos los trials
+    # Ref: objective.ml:554 - gaussian_noise 2.0
+    key, subkey = jax.random.split(key)
+    u_current = 2.0 * jax.random.normal(
+        subkey, shape=(N, n_trials)
+    )  # Shape: (N, n_trials)
 
-    # Costo de varianza (con lambda normalizada)
-    cost_var = lambda_var_norm * jnp.sum((empirical_var - target_var)**2)
+    # Inicializar ruido para cada trial
+    key, subkey = jax.random.split(key)
+    eta_current = L_eta @ jax.random.normal(
+        subkey, shape=(N, n_trials)
+    )  # Shape: (N, n_trials)
 
-    # Costo de covarianza (norma de Frobenius, con lambda normalizada)
-    cost_cov = lambda_cov_norm * jnp.sum(
-        (sigma_empirical - target_sigma)**2
+    # Acumuladores de costo
+    # Ref: objective.ml:555
+    accu_mean = 0.0
+    accu_var = 0.0
+    accu_cov = 0.0
+
+    # Variables para retornar (último timestep)
+    mu_empirical = jnp.zeros(N_E)
+    sigma_empirical = jnp.zeros((N_E, N_E))
+
+    def timestep_update(carry, t):
+        """Single timestep update for all trials in parallel."""
+        u, eta, accu_m, accu_v, accu_c = carry
+
+        # Generar key para este timestep
+        key_t = jax.random.fold_in(key, t)
+
+        # Activación supralineal: r = k * [u]_+^2
+        # Shape: (N, n_trials)
+        r = k * jnp.maximum(0, u)**2
+
+        # Dinámica determinística: du/dt = -u + W@r + h
+        # Ref: objective.ml:534-536
+        # Shape: (N, n_trials)
+        f = inv_taus[:, None] * (-u + (w @ r) + h_vec[:, None])
+
+        # Actualizar ruido OU para cada trial
+        # Ref: objective.ml:524 (proceso OU discretizado)
+        xi = jax.random.normal(key_t, shape=(N, n_trials))
+        noise_white = L_eta @ xi
+        eta_new = alpha_eta * eta + beta_eta_scale * noise_white
+
+        # Integración Euler-Maruyama
+        u_new = u + dt * f + eta_new
+
+        # Soft threshold para estabilidad
+        # Ref: objective.ml:538-539
+        soft_gain = 100.0
+        u_new = soft_gain * jnp.tanh(u_new / soft_gain)
+
+        # Calcular momentos across trials si es timestep subsampleado
+        # Ref: objective.ml:544-549
+        def compute_costs_at_timestep():
+            # Momentos across trials (solo neuronas excitatorias)
+            # Ref: objective.ml:541 - mu across trials
+            u_exc = u_new[:N_E, :]  # Shape: (N_E, n_trials)
+            mu = u_exc.mean(axis=1)  # Shape: (N_E,)
+
+            # Ref: objective.ml:542-543 - sigma across trials
+            u_centered = u_exc - mu[:, None]  # Shape: (N_E, n_trials)
+            sigma = (u_centered @ u_centered.T) / n_trials  # (N_E, N_E)
+
+            # Temporal weighting
+            # Ref: objective.ml:545
+            wt = temporal_weighting[t]
+
+            # Costos
+            # Ref: objective.ml:546-548
+            target_var = jnp.diag(target_sigma)
+            empirical_var = jnp.diag(sigma)
+
+            c_mean = lambda_mean_norm * jnp.sum((mu - target_mu)**2)
+            c_var = lambda_var_norm * jnp.sum((empirical_var - target_var)**2)
+            c_cov = lambda_cov_norm * jnp.sum((sigma - target_sigma)**2)
+
+            # Acumular con temporal_weighting
+            # Ref: objective.ml:549
+            return (
+                accu_m + wt * c_mean,
+                accu_v + wt * c_var,
+                accu_c + wt * c_cov,
+                mu,
+                sigma
+            )
+
+        def no_costs():
+            return accu_m, accu_v, accu_c, mu_empirical, sigma_empirical
+
+        # Solo calcular costos en timesteps subsampleados
+        is_subsamp = (t % subsamp_bins == 0)
+        new_accu_m, new_accu_v, new_accu_c, new_mu, new_sigma = jax.lax.cond(
+            is_subsamp,
+            compute_costs_at_timestep,
+            no_costs
+        )
+
+        return (
+            (u_new, eta_new, new_accu_m, new_accu_v, new_accu_c),
+            (new_mu, new_sigma)
+        )
+
+    # Integrar dinámica timestep por timestep
+    # Ref: objective.ml:532-556 (función accumulate recursiva)
+    carry_final, (mu_traj, sigma_traj) = jax.lax.scan(
+        timestep_update,
+        (u_current, eta_current, accu_mean, accu_var, accu_cov),
+        jnp.arange(n_time_bins)
     )
+    u_final, eta_final, accu_mean, accu_var, accu_cov = carry_final
 
-    # Costo total
-    total_cost = cost_mean + cost_var + cost_cov
+    # Momentos del último timestep para retornar
+    # Ref: objective.ml:551
+    mu_empirical = mu_traj[-1]
+    sigma_empirical = sigma_traj[-1]
+
+    # Costo total acumulado
+    # Ref: objective.ml:581-583
+    total_cost = accu_mean + accu_var + accu_cov
 
     return total_cost, mu_empirical, sigma_empirical

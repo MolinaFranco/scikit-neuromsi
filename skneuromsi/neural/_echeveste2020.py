@@ -76,33 +76,6 @@ class SSNIntegrator:
         """
         return self.k * np.power(np.maximum(0, u), self.n)
 
-    # TODELETE
-    def parametric_connectivity(self, theta_i, theta_j, a_xy, d_xy):
-        """
-        Calculate parametric connectivity using the formula in Equation 10.
-
-        Implement: W_XY(θi, θj) = a_XY * exp[(cos(2(θi - θj)) - 1) / d_XY²]
-        where:
-        - θi, θj: preferred orientations of neurons i, j (in radians)
-        - a_XY: connectivity amplitude between X→Y populations
-        - d_XY: connectivity width (dispersion parameter)
-
-        Mathematical foundation:
-        - Main paper, Eq. 10: Parametric connectivity with angular differences
-        - Only 8 parameters: {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}
-        - Circular topology: angular differences θi - θj determine
-            connection strength
-
-        """
-        angular_diff = theta_i - theta_j  # Diferencia θi - θj
-
-        exp_term = np.exp((np.cos(2 * angular_diff) - 1) / (d_xy**2))
-
-        # Conectividad final: amplitud × perfil espacial
-        W_xy = a_xy * exp_term
-
-        return W_xy
-
     def __call__(self, u_e, u_i, t, W, h, eta):
         """
         Compute the SSN dynamics based on Echeveste et al. (2020).
@@ -621,10 +594,13 @@ class Echeveste2020(SKNMSIMethodABC):
             theta = jnp.linspace(0, jnp.pi, self._N_E, endpoint=False)
 
             # Función auxiliar para construir bloques
+            # Ref: objective.ml lines 285-287
+            # Formula: W_XY(θi, θj) = s * a * exp[(cos(θi - θj) - 1) / d²]
+            # IMPORTANTE: SIN factor 2 en coseno (ver Equation 10 paper)
             def connectivity_block(theta_pre, theta_post, a, d, sign):
                 delta = theta_pre[:, None] - theta_post[None, :]
                 return sign * a * jnp.exp(
-                    (jnp.cos(2 * delta) - 1) / (d**2)
+                    (jnp.cos(delta) - 1) / (d**2)
                 )
 
             # Construir bloques
@@ -712,6 +688,13 @@ class Echeveste2020(SKNMSIMethodABC):
         print(f"Initial parameters: {initial_params}")
         print("=" * 60)
 
+        # Inicializar temporal_weighting para annealing
+        # Ref: train.ml line 281, objective.ml line 528
+        n_time_bins = int(t_max / dt)
+        min_time_bins = int(0.05 / dt)  # Fijo: últimos 50ms
+        min_time_fixed = 0.05  # Fijo: 50ms
+        temporal_weighting = np.ones(n_time_bins)
+
         # Función de costo con sampling estocástico
         def compute_cost_and_grad(x, iteration, key):
             """
@@ -719,28 +702,36 @@ class Echeveste2020(SKNMSIMethodABC):
 
             Paper: "using N_trial = 50 trials for each training stimulus
             to estimate the corresponding moments"
-            """
-            # Temporal annealing: T_min increases linearly over iterations
-            # Paper: "T_min was systematically changed ('annealed') from
-            # T_min = 0 ms to T_max - 50 ms"
-            # train.ml lines 240-243
-            progress = iteration / max_iter
-            current_t_min = (
-                t_min_initial + progress * (t_min_final - t_min_initial)
-            )
 
+            TEMPORAL ANNEALING:
+            -------------------
+            En lugar de cambiar min_time, usamos temporal_weighting que
+            se actualiza en cada iteración (ver código original OCaml).
+
+            Ref: train.ml lines 240-243, 286
+            - Line 240-243: update_temporal_weighting función
+            - Line 286: update_temporal_weighting k (en cada iteración)
+
+            Paper Methods página 18:
+            "the beginning of the averaging time window, T_min in Eqs.  26-28,
+            was systematically changed ('annealed') from T_min = 0 ms to
+            T_max - 50 ms during the initial 200 iterations"
+            """
             # Construir matriz W desde parámetros
             w = build_w_from_params(x)
 
-            # Calcular costo con N_trial samples
+            # Calcular costo con N_trial samples y temporal_weighting
             # Paper: "Both the network's initial conditions and the process
             # noise were re-sampled for each trial and iteration"
+            # Ref: objective.ml lines 544-550 (usa wt en cada timestep)
             cost, _, _ = compute_costs_with_samples(
                 w, h_vec, sigma_eta, inv_taus, dt,
                 self._integrator.f.tau_n, t_max, t_subsamp,
                 target_mu, target_sigma, self._integrator.f.k,
-                lambda_mean, lambda_var, lambda_cov, current_t_min,
-                n_trials, key
+                lambda_mean, lambda_var, lambda_cov,
+                min_time_fixed,  # ← FIJO, no cambia (50ms)
+                n_trials, key,
+                temporal_weighting=temporal_weighting  # ← Cambia cada iter
             )
 
             return cost
@@ -769,9 +760,25 @@ class Echeveste2020(SKNMSIMethodABC):
         # Random key para reproducibilidad
         key = jax.random.PRNGKey(params.get('seed', 42))
 
+        # Inicializar temporal_weighting antes del loop
+        # Ref: train.ml line 281
+        from ._echeveste_training import update_temporal_weighting
+        update_temporal_weighting(
+            temporal_weighting, n_time_bins, min_time_bins,
+            iteration=1, max_iterations=200
+        )
+
         # ADAM optimization loop
         # Paper: "performed 250 iterations of the ADAM optimizer"
         for iteration in range(1, max_iter + 1):
+            # Actualizar temporal_weighting (annealing progresivo)
+            # Ref: train.ml line 286
+            # "update_temporal_weighting k" en cada iteración
+            update_temporal_weighting(
+                temporal_weighting, n_time_bins, min_time_bins,
+                iteration, max_iterations=200
+            )
+
             # Generar nuevo key para este iteration
             # Paper: "re-sampled for each trial and iteration"
             key, subkey = jax.random.split(key)
@@ -909,7 +916,7 @@ class Echeveste2020(SKNMSIMethodABC):
             params = {}
 
         # Parámetros de optimización
-        max_iter = params.get('max_iter', 50)
+        max_iter = params.get('max_iter', 250)  # train.ml default: 1000
         dt = params.get('dt', 0.2e-3)
         t_max = params.get('t_max', 0.1)
         t_subsamp = params.get('t_subsamp', 10.0e-3)
@@ -917,6 +924,7 @@ class Echeveste2020(SKNMSIMethodABC):
         lambda_mean = params.get('lambda_mean', 1.0)
         lambda_var = params.get('lambda_var', 1.0)
         lambda_cov = params.get('lambda_cov', 1.0)
+        lambda_slow = params.get('lambda_slow', 0.0)  # Default 0, can use 0.1
 
         # Inicializar parámetros de ruido
         # objective.ml lines 174-179
@@ -1065,11 +1073,13 @@ class Echeveste2020(SKNMSIMethodABC):
             )
 
             # Calcular costo usando ADF
+            # Ref: objective.ml:464-467 (includes slowness cost)
             cost, _, _ = compute_evolution_costs(
                 jnp.array(W_fixed), h_vec, sigma_eta, inv_taus,
                 dt, self._integrator.f.tau_n, t_max, t_subsamp,
                 target_mu, target_sigma, self._integrator.f.k,
-                lambda_mean, lambda_var, lambda_cov, min_time
+                lambda_mean, lambda_var, lambda_cov, lambda_slow,
+                min_time
             )
 
             # Manejar NaN/Inf
@@ -1093,15 +1103,126 @@ class Echeveste2020(SKNMSIMethodABC):
             g = grad_fn(jnp.array(x))
             return np.array(g)
 
-        # Optimización usando L-BFGS-B
-        result = minimize(
-            objective,
-            x0,
-            method='L-BFGS-B',
-            jac=gradient,  # Usar gradientes analíticos de JAX
-            bounds=bounds,
-            options={'maxiter': max_iter, 'disp': True}
-        )
+        # Optimización usando L-BFGS-B con parámetros del código original
+        # Ref: train.ml:269
+        # - corrections=20: mantener 20 correcciones en memoria
+        #   (historia Hessiano)
+        # - ftol=1e-10: tolerancia función (factr=1E1 → ftol ≈ 1e-10)
+        # - gtol=1e-8: tolerancia gradiente (pgtol=0, usamos pequeño)
+        lbfgs_options = {
+            'maxiter': max_iter,
+            'disp': True,
+            'maxcor': 20,      # corrections: history size for Hessian approx
+            'ftol': 1e-10,     # function tolerance
+            'gtol': 1e-8,      # gradient tolerance (original uses pgtol=0)
+        }
+
+        # Parámetros de recovery
+        max_recovery_attempts = params.get('max_recovery_attempts', 10)
+        recovery_step_size = params.get('recovery_step_size', 0.001)
+
+        # Recovery Mechanism (train.ml:268-277)
+        # Si L-BFGS falla, hacer mini gradient step y reintentar
+        def attempt_optimization(x_current, attempt_num):
+            """
+            Attempt L-BFGS optimization with recovery mechanism.
+
+            Si falla, toma mini gradient step y reintenta recursivamente.
+
+            Ref: train.ml lines 268-277
+            ```ocaml
+            let rec attempt () =
+              try Lbfgs.(...) |> ignore
+              with _ -> begin
+                  save_results x "failed";
+                  let _, g = fdf x in
+                  Vec.sub ~z:x x F.(0.001 *.:| g) |> ignore;
+                  attempt ()
+                end
+            in attempt ()
+            ```
+            """
+            print(f"\n{'='*60}")
+            print(f"L-BFGS Attempt {attempt_num}/{max_recovery_attempts}")
+            print(f"{'='*60}")
+
+            try:
+                # Intentar L-BFGS-B optimization
+                result = minimize(
+                    objective,
+                    x_current,
+                    method='L-BFGS-B',
+                    jac=gradient,
+                    bounds=bounds,
+                    options=lbfgs_options
+                )
+
+                # Si converge exitosamente, retornar
+                if result.success:
+                    print("\n✓ L-BFGS converged successfully")
+                    return result, False  # (result, used_recovery)
+
+                # Si termina sin success flag pero sin excepción
+                # Considerar como falla soft
+                msg = result.message
+                print(f"\n⚠ L-BFGS finished but not successful: {msg}")
+
+                # Si alcanzamos max attempts, retornar falla
+                if attempt_num >= max_recovery_attempts:
+                    print("✗ Max recovery attempts reached")
+                    return result, True
+
+                # Recovery: mini gradient step
+                raise RuntimeError(f"L-BFGS failed: {result.message}")
+
+            except Exception as e:
+                print(f"\n✗ L-BFGS failed: {str(e)[:100]}")
+
+                # Si alcanzamos max attempts, retornar último resultado
+                if attempt_num >= max_recovery_attempts:
+                    print("✗ Max recovery attempts reached, "
+                          "returning last state")
+                    # Crear resultado dummy
+                    from scipy.optimize import OptimizeResult
+                    return OptimizeResult(
+                        x=x_current,
+                        success=False,
+                        message="Max recovery attempts reached",
+                        fun=objective(x_current),
+                        nit=0,
+                        nfev=0
+                    ), True
+
+                # Recovery mechanism: mini gradient descent step
+                # Ref: train.ml:273-274
+                print(f"→ Taking mini gradient step (α={recovery_step_size})")
+
+                # Calcular gradiente en x_current
+                try:
+                    grad = gradient(x_current)
+                except Exception as grad_e:
+                    print(f"✗ Gradient computation failed: {grad_e}")
+                    # Si gradient falla, perturbar aleatoriamente
+                    grad = np.random.randn(len(x_current)) * 0.01
+
+                # Mini step: x ← x - α·∇f(x)
+                # Ref: train.ml:274
+                x_new = x_current - recovery_step_size * grad
+
+                # Proyectar a bounds
+                for i, (lb, ub) in enumerate(bounds):
+                    x_new[i] = np.clip(x_new[i], lb, ub)
+
+                grad_norm = np.linalg.norm(grad)
+                step_size = recovery_step_size * grad_norm
+                print(f"   Gradient norm: {grad_norm:.6e}")
+                print(f"   Step size: {step_size:.6e}")
+
+                # Reintentar recursivamente
+                return attempt_optimization(x_new, attempt_num + 1)
+
+        # Comenzar optimización con recovery mechanism
+        result, used_recovery = attempt_optimization(x0, attempt_num=1)
 
         # Desempaquetar parámetros optimizados
         optimized_noise_params = unpack_noise_parameters(result.x)
@@ -1120,6 +1241,7 @@ class Echeveste2020(SKNMSIMethodABC):
 
         print("\nStage 2 optimization finished:")
         print(f"  Success: {result.success}")
+        print(f"  Used recovery: {used_recovery}")
         print(f"  Final cost: {result.fun:.6f}")
         print(f"  Iterations: {result.nit}/{max_iter}")
         print(f"  Message: {result.message}")
@@ -1142,9 +1264,11 @@ class Echeveste2020(SKNMSIMethodABC):
                 self._Sigma_eta.shape if result.success else None
             ),
             'success': bool(result.success),
+            'used_recovery': used_recovery,
             'message': str(result.message),
             'nfev': int(result.nfev),
-            'njev': int(result.njev) if hasattr(result, 'njev') else None
+            'njev': int(result.njev) if hasattr(result, 'njev') else None,
+            'lambda_slow': lambda_slow,
         }
 
     def _build_noise_covariance(self, width, std_e, std_i, rho):
@@ -2027,7 +2151,7 @@ class Echeveste2020(SKNMSIMethodABC):
         """
         Calculate parametric connectivity using the formula in Equation 10.
 
-        Implement: W_XY(θi, θj) = a_XY * exp[(cos(2(θi - θj)) - 1) / d_XY²]
+        Implement: W_XY(θi, θj) = a_XY * exp[(cos(θi - θj) - 1) / d_XY²]
         where:
         - θi, θj: preferred orientations of neurons i, j (in radians)
         - a_XY: connectivity amplitude between X→Y populations
@@ -2038,10 +2162,11 @@ class Echeveste2020(SKNMSIMethodABC):
         - Only 8 parameters: {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}
         - Circular topology: angular differences θi - θj
         determine connection strength
+        - Ref: objective.ml lines 285-287 (SIN factor 2 en coseno)
         """
         angular_diff = theta_i - theta_j  # Diferencia θi - θj
 
-        exp_term = np.exp((np.cos(2 * angular_diff) - 1) / (d_xy**2))
+        exp_term = np.exp((np.cos(angular_diff) - 1) / (d_xy**2))
 
         # Conectividad final: amplitud × perfil espacial
         W_xy = a_xy * exp_term
@@ -2053,8 +2178,9 @@ class Echeveste2020(SKNMSIMethodABC):
         Construct connectivity matrix using parametric formulation (Eq.10).
 
         Mathematical foundation:
-        - Main paper, Eq. 10: W_XY(θi,θj) = a_XY * exp[(cos(2(θi-θj))-1)/d_XY²]
+        - Main paper, Eq. 10: W_XY(θi,θj) = a_XY * exp[(cos(θi-θj)-1)/d_XY²]
         - Only 8 parameters: {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}
+        - Ref: objective.ml lines 285-287 (SIN factor 2 en coseno)
         - Echeveste et al. (2020) Supplementary Material: Connectivity
           Parameter Optimization
 
@@ -2125,9 +2251,12 @@ class Echeveste2020(SKNMSIMethodABC):
         W = np.zeros((self._N, self._N))
 
         # Construir bloques de conectividad usando parametric_connectivity
+        # Ref: objective.ml lines 285-287
+        # Formula: W_XY(θi, θj) = s * a * exp[(cos(θi - θj) - 1) / d²]
+        # IMPORTANTE: SIN factor 2 en coseno (Echeveste et al. 2020, Eq. 10)
         def connectivity_block(theta_pre, theta_post, a, d, sign=1):
             delta_theta = theta_post[:, None] - theta_pre[None, :]
-            return sign * a * np.exp((np.cos(2 * delta_theta) - 1) / d**2)
+            return sign * a * np.exp((np.cos(delta_theta) - 1) / d**2)
 
         # Bloques matriciales con signos correctos según código original
         # Original: E→E (+), E→I (-), I→E (+), I→I (-)
