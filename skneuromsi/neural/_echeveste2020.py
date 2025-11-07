@@ -737,8 +737,13 @@ class Echeveste2020(SKNMSIMethodABC):
 
             return cost
 
-        # Función para calcular gradiente usando JAX autodiff
-        grad_fn = jax.grad(compute_cost_and_grad, argnums=0)
+        # Función para calcular costo Y gradiente en una sola pasada
+        # OPTIMIZACIÓN: value_and_grad es más eficiente que dos llamadas
+        # separadas (cost + grad) porque hace forward+backward una sola vez
+        # Ref: DIAGNOSTICO_OOM_STAGE1.md
+        cost_and_grad_fn = jax.value_and_grad(
+            compute_cost_and_grad, argnums=0
+        )
 
         # Inicializar parámetros
         x = x0.copy()
@@ -784,11 +789,12 @@ class Echeveste2020(SKNMSIMethodABC):
             # Paper: "re-sampled for each trial and iteration"
             key, subkey = jax.random.split(key)
 
-            # Calcular costo y gradiente
-            cost = compute_cost_and_grad(x, iteration, subkey)
-            grad = grad_fn(x, iteration, subkey)
+            # Calcular costo Y gradiente en una sola pasada
+            # OPTIMIZACIÓN: Evita doble evaluación forward+backward
+            cost, grad = cost_and_grad_fn(x, iteration, subkey)
 
             # Convertir a numpy para manipulación
+            # OPTIMIZACIÓN: Libera arrays JAX intermediate
             grad = np.array(grad)
             cost_val = float(cost)
 
@@ -798,17 +804,28 @@ class Echeveste2020(SKNMSIMethodABC):
             if grad_norm > grad_clip:
                 grad = grad * (grad_clip / grad_norm)
 
-            # ADAM update
+            # ADAM update en numpy para evitar acumulación de JAX arrays
+            # OPTIMIZACIÓN: Trabajar en numpy reduce presión de memoria JAX
+            # Ref: DIAGNOSTICO_OOM_STAGE1.md
+            m_np = np.array(m)
+            v_np = np.array(v)
+            x_np = np.array(x)
+
             # Paper referencias: Kingma & Ba (2015)
-            m = beta1 * m + (1 - beta1) * grad
-            v = beta2 * v + (1 - beta2) * (grad ** 2)
+            m_np = beta1 * m_np + (1 - beta1) * grad
+            v_np = beta2 * v_np + (1 - beta2) * (grad ** 2)
 
             # Bias correction
-            m_hat = m / (1 - beta1 ** iteration)
-            v_hat = v / (1 - beta2 ** iteration)
+            m_hat = m_np / (1 - beta1 ** iteration)
+            v_hat = v_np / (1 - beta2 ** iteration)
 
             # Parameter update
-            x = x - eta * m_hat / (jnp.sqrt(v_hat) + epsilon_adam)
+            x_np = x_np - eta * m_hat / (np.sqrt(v_hat) + epsilon_adam)
+
+            # Convertir de vuelta a JAX (necesario para bounds)
+            x = jnp.array(x_np)
+            m = jnp.array(m_np)
+            v = jnp.array(v_np)
 
             # Apply bounds
             # train.ml lines 235-238: width parameters bounded by sqrt(2)
@@ -835,6 +852,15 @@ class Echeveste2020(SKNMSIMethodABC):
                       f"Cost: {cost_val:.5f} | "
                       f"T_min: {current_t_min*1000:.1f}ms | "
                       f"||grad||: {grad_norm:.3f}")
+
+            # Limpieza periódica de memoria para evitar OOM
+            # OPTIMIZACIÓN: Cada 10 iteraciones limpiamos cachés de JAX
+            # Aumentada frecuencia para 250 iter (antes era cada 20)
+            # Ref: DIAGNOSTICO_OOM_STAGE1.md
+            if iteration % 10 == 0:
+                import gc
+                jax.clear_caches()  # Limpiar cachés de compilación JAX
+                gc.collect()        # Garbage collection de Python
 
         # Use best parameters found
         x_final = best_x

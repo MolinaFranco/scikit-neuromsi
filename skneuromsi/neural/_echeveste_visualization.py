@@ -177,7 +177,7 @@ def plot_membrane_potentials(
     else:
         fig, ax = plt.subplots(1, 1, figsize=figsize)
 
-        if population == "excitatory_firing_rate":
+        if population == "excitatory":
             data = excitatory
             pop_name = "Excitatory"
             indices = exc_indices
@@ -316,7 +316,7 @@ def plot_firing_rates(
     else:
         fig, ax = plt.subplots(1, 1, figsize=figsize)
 
-        if population == "excitatory_firing_rate":
+        if population == "excitatory":
             data = excitatory
             pop_name = "Excitatory"
             indices = exc_indices
@@ -539,7 +539,7 @@ def plot_autocorrelation(
     fig : matplotlib.figure.Figure
     ax : matplotlib.axes.Axes
     """
-    if population == "excitatory_firing_rate":
+    if population == "excitatory":
         data = _extract_mode_data(result, "excitatory_firing_rate")
         pop_name = "Excitatory"
     else:
@@ -590,7 +590,7 @@ def plot_autocorrelation(
 
 def plot_power_spectrum(
     result,
-    population="excitatory_firing_rate",
+    population="excitatory",
     freq_range=(0, 100),
     figsize=(12, 5),
     title=None,
@@ -623,7 +623,7 @@ def plot_power_spectrum(
     fig : matplotlib.figure.Figure
     ax : matplotlib.axes.Axes
     """
-    if population == "excitatory_firing_rate":
+    if population == "excitatory":
         data = _extract_mode_data(result, "excitatory_firing_rate")
         pop_name = "Excitatory"
     else:
@@ -1320,3 +1320,154 @@ def plot_spatial_sampling(result, n_samples=10, figsize=(16, 10),
     plt.tight_layout()
 
     return fig, axes
+
+
+def plot_all_dynamics(result, output_dir=None, save_figures=True,
+                      show_figures=False):
+    """
+    Generate all available dynamics visualizations in a single call.
+
+    This convenience function generates all standard visualization plots
+    for neural dynamics analysis, saving them automatically to a directory.
+
+    Mathematical foundation:
+        - Combines all visualization analyses from Main paper Figures 2-7
+        - Provides comprehensive overview of SSN dynamics
+
+    Parameters
+    ----------
+    result : NDResult
+        Result object from Echeveste2020.run()
+    output_dir : str or Path, optional
+        Directory to save figures. If None, uses current directory.
+        Default: None
+    save_figures : bool, optional
+        Whether to save figures to disk. Default: True
+    show_figures : bool, optional
+        Whether to display figures interactively. Default: False
+
+    Returns
+    -------
+    figures : dict
+        Dictionary mapping figure names to (fig, axes) tuples
+
+    Examples
+    --------
+    >>> ssn = Echeveste2020(N_E=50, N_I=50, seed=42)
+    >>> ssn.load_parameters()
+    >>> result = ssn.run(stimulus_contrast=0.5, simulation_time=200.0)
+    >>> # Generate all plots and save them
+    >>> figs = plot_all_dynamics(result, output_dir='outputs/dynamics')
+    >>> # Or just generate without saving
+    >>> figs = plot_all_dynamics(result, save_figures=False)
+
+    Notes
+    -----
+    Generates the following visualizations:
+    1. membrane_potentials - Membrane potential traces
+    2. firing_rates - Firing rate traces
+    3. population_activity - Population heatmaps
+    4. mean_firing_rates - Mean population rates
+    5. autocorrelation - Temporal autocorrelation
+    6. power_spectrum - Frequency analysis
+    7. dynamics_summary - 6-panel comprehensive summary
+    8. heatmap_excitatory - Complete excitatory activity
+    9. spatial_sampling - Spatially distributed neurons
+    """
+    from pathlib import Path
+
+    figures = {}
+
+    # Setup output directory
+    if output_dir is not None:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+    else:
+        output_path = Path('.')
+
+    # 1. Membrane potentials
+    fig, ax = plot_membrane_potentials(result, n_samples=10)
+    figures['membrane_potentials'] = (fig, ax)
+    if save_figures and output_dir:
+        fig.savefig(output_path / 'membrane_potentials.png',
+                    dpi=150, bbox_inches='tight')
+    if not show_figures:
+        plt.close(fig)
+
+    # 2. Firing rates
+    fig, ax = plot_firing_rates(result)
+    figures['firing_rates'] = (fig, ax)
+    if save_figures and output_dir:
+        fig.savefig(output_path / 'firing_rates.png',
+                    dpi=150, bbox_inches='tight')
+    if not show_figures:
+        plt.close(fig)
+
+    # 3. Population activity
+    fig, ax = plot_population_activity(result)
+    figures['population_activity'] = (fig, ax)
+    if save_figures and output_dir:
+        fig.savefig(output_path / 'population_activity.png',
+                    dpi=150, bbox_inches='tight')
+    if not show_figures:
+        plt.close(fig)
+
+    # 4. Mean firing rates
+    fig, ax = plot_mean_firing_rates(result)
+    figures['mean_firing_rates'] = (fig, ax)
+    if save_figures and output_dir:
+        fig.savefig(output_path / 'mean_firing_rates.png',
+                    dpi=150, bbox_inches='tight')
+    if not show_figures:
+        plt.close(fig)
+
+    # 5. Autocorrelation
+    fig, ax = plot_autocorrelation(result)
+    figures['autocorrelation'] = (fig, ax)
+    if save_figures and output_dir:
+        fig.savefig(output_path / 'autocorrelation.png',
+                    dpi=150, bbox_inches='tight')
+    if not show_figures:
+        plt.close(fig)
+
+    # 6. Power spectrum
+    fig, ax = plot_power_spectrum(result)
+    figures['power_spectrum'] = (fig, ax)
+    if save_figures and output_dir:
+        fig.savefig(output_path / 'power_spectrum.png',
+                    dpi=150, bbox_inches='tight')
+    if not show_figures:
+        plt.close(fig)
+
+    # 7. Dynamics summary (6-panel)
+    fig, axes = plot_neural_dynamics_summary(result)
+    figures['dynamics_summary'] = (fig, axes)
+    if save_figures and output_dir:
+        fig.savefig(output_path / 'dynamics_summary.png',
+                    dpi=150, bbox_inches='tight')
+    if not show_figures:
+        plt.close(fig)
+
+    # 8. Heatmap excitatory (4-panel)
+    fig, axes = plot_heatmap_activity(result, population='excitatory')
+    figures['heatmap_excitatory'] = (fig, axes)
+    if save_figures and output_dir:
+        fig.savefig(output_path / 'heatmap_excitatory.png',
+                    dpi=150, bbox_inches='tight')
+    if not show_figures:
+        plt.close(fig)
+
+    # 9. Spatial sampling
+    fig, axes = plot_spatial_sampling(result, n_samples=10)
+    figures['spatial_sampling'] = (fig, axes)
+    if save_figures and output_dir:
+        fig.savefig(output_path / 'spatial_sampling.png',
+                    dpi=150, bbox_inches='tight')
+    if not show_figures:
+        plt.close(fig)
+
+    if save_figures and output_dir:
+        print(f"✓ Generated {len(figures)} figures")
+        print(f"  Saved to: {output_path.absolute()}")
+
+    return figures
