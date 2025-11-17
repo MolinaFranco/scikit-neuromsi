@@ -57,6 +57,112 @@ def _extract_mode_data(result, mode_name):
     return data
 
 
+def _get_stimulus_info(result):
+    """
+    Extract stimulus presentation information from NDResult.
+
+    Parameters
+    ----------
+    result : NDResult
+        Result object from Echeveste2020.run()
+
+    Returns
+    -------
+    dict
+        Dictionary with stimulus presentation information:
+        - 'use_three_phases': bool, whether three-phase mode was used
+        - 't_init': float or None, duration of pre-stimulus phase (ms)
+        - 't_stimulus': float or None, duration of stimulus phase (ms)
+        - 't_final': float or None, duration of post-stimulus phase (ms)
+        - 'use_delays': bool or None, whether delays were used
+        - 'stimulus_start': float or None, time when stimulus starts (ms)
+        - 'stimulus_end': float or None, time when stimulus ends (ms)
+    """
+    # Extraer información del diccionario extra de result
+    # NDResult uses extra_ (with underscore) as property
+    if hasattr(result, 'extra_'):
+        extra = result.extra_.to_dict()
+    elif hasattr(result, 'extra'):
+        extra = result.extra
+    else:
+        extra = {}
+
+    use_three_phases = extra.get('use_three_phases', False)
+    t_init = extra.get('t_init', None)
+    t_stimulus = extra.get('t_stimulus', None)
+    t_final = extra.get('t_final', None)
+    use_delays = extra.get('use_delays', None)
+
+    # Calcular tiempos de inicio y fin del estímulo
+    if use_three_phases and t_init is not None and t_stimulus is not None:
+        stimulus_start = t_init
+        stimulus_end = t_init + t_stimulus
+    else:
+        # Single-phase mode: estímulo presente todo el tiempo
+        stimulus_start = None
+        stimulus_end = None
+
+    return {
+        'use_three_phases': use_three_phases,
+        't_init': t_init,
+        't_stimulus': t_stimulus,
+        't_final': t_final,
+        'use_delays': use_delays,
+        'stimulus_start': stimulus_start,
+        'stimulus_end': stimulus_end,
+    }
+
+
+def _add_stimulus_overlay(ax, result, alpha=0.15, color='yellow',
+                          label='Stimulus'):
+    """
+    Add visual overlay showing stimulus presentation period.
+
+    Adds a shaded region (axvspan) to indicate when stimulus is present.
+    For three-phase mode, highlights the stimulus presentation phase.
+    For single-phase mode, adds a note that stimulus is always present.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes object to add the overlay to
+    result : NDResult
+        Result object from Echeveste2020.run()
+    alpha : float, optional
+        Transparency of the overlay (0-1), default 0.15
+    color : str, optional
+        Color of the overlay, default 'yellow'
+    label : str, optional
+        Label for the overlay in legend, default 'Stimulus'
+
+    Returns
+    -------
+    bool
+        True if overlay was added, False otherwise
+    """
+    stim_info = _get_stimulus_info(result)
+
+    if stim_info['use_three_phases']:
+        # Three-phase mode: marcar período de estímulo
+        if (stim_info['stimulus_start'] is not None and
+                stim_info['stimulus_end'] is not None):
+            ax.axvspan(
+                stim_info['stimulus_start'],
+                stim_info['stimulus_end'],
+                alpha=alpha,
+                color=color,
+                label=label,
+                zorder=0  # Colocar detrás de los datos
+            )
+            return True
+    else:
+        # Single-phase mode: agregar nota en título si no existe ya
+        # (no agregamos overlay porque el estímulo está siempre presente)
+        pass
+
+    return False
+
+
 def plot_membrane_potentials(
     result,
     neuron_indices=None,
@@ -138,6 +244,10 @@ def plot_membrane_potentials(
     if population == "both":
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
 
+        # Agregar overlay de estímulo (primero para que quede detrás)
+        _add_stimulus_overlay(ax1, result)
+        _add_stimulus_overlay(ax2, result)
+
         # Graficar neuronas excitatorias
         for idx in exc_indices:
             if idx < excitatory.shape[1]:
@@ -176,6 +286,9 @@ def plot_membrane_potentials(
 
     else:
         fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+        # Agregar overlay de estímulo
+        _add_stimulus_overlay(ax, result)
 
         if population == "excitatory":
             data = excitatory
@@ -277,6 +390,10 @@ def plot_firing_rates(
     if population == "both":
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
 
+        # Agregar overlay de estímulo
+        _add_stimulus_overlay(ax1, result)
+        _add_stimulus_overlay(ax2, result)
+
         # Graficar neuronas excitatorias
         for idx in exc_indices:
             if idx < excitatory.shape[1]:
@@ -315,6 +432,9 @@ def plot_firing_rates(
 
     else:
         fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+        # Agregar overlay de estímulo
+        _add_stimulus_overlay(ax, result)
 
         if population == "excitatory":
             data = excitatory
@@ -474,6 +594,9 @@ def plot_mean_firing_rates(
 
     fig, ax = plt.subplots(1, 1, figsize=figsize)
 
+    # Agregar overlay de estímulo
+    _add_stimulus_overlay(ax, result)
+
     # Graficar media ± std para excitatorias
     ax.plot(time_axis, exc_mean, label="Excitatory mean", color="C0", lw=2)
     ax.fill_between(
@@ -577,6 +700,10 @@ def plot_autocorrelation(
     lag_axis = np.arange(max_lag) * dt
 
     fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+    # Nota: autocorrelación es en función del lag, no del tiempo absoluto
+    # Por lo tanto, no agregamos overlay de estímulo aquí
+
     ax.plot(lag_axis, autocorr_mean, lw=2, color="C0")
     ax.axhline(0, color="k", linestyle="--", alpha=0.3)
     ax.set_xlabel("Time lag (ms)")
@@ -827,6 +954,9 @@ def plot_fano_factor(
 
     fig, ax = plt.subplots(1, 1, figsize=figsize)
 
+    # Agregar overlay de estímulo
+    _add_stimulus_overlay(ax, result)
+
     ax.plot(window_times, fano_factors, lw=2, color="C0")
     ax.set_xlabel("Time (ms)")
     ax.set_ylabel("Fano Factor (Var/Mean)")
@@ -871,6 +1001,8 @@ def plot_neural_dynamics_summary(result, figsize=(16, 12)):
     ax1 = fig.add_subplot(gs[0, 0])
     exc_mean = np.mean(excitatory, axis=1)
     inh_mean = np.mean(inhibitory, axis=1)
+    # Agregar overlay de estímulo
+    _add_stimulus_overlay(ax1, result)
     ax1.plot(time_axis, exc_mean, label="Excitatory", color="C0", lw=2)
     ax1.plot(time_axis, inh_mean, label="Inhibitory", color="C1", lw=2)
     ax1.set_xlabel("Time (ms)")
@@ -955,6 +1087,8 @@ def plot_neural_dynamics_summary(result, figsize=(16, 12)):
     ax5 = fig.add_subplot(gs[2, 0])
     exc_std = np.std(excitatory, axis=1)
     inh_std = np.std(inhibitory, axis=1)
+    # Agregar overlay de estímulo
+    _add_stimulus_overlay(ax5, result)
     ax5.plot(time_axis, exc_std, label="Excitatory", color="C0", lw=2)
     ax5.plot(time_axis, inh_std, label="Inhibitory", color="C1", lw=2)
     ax5.set_xlabel("Time (ms)")
@@ -980,6 +1114,8 @@ def plot_neural_dynamics_summary(result, figsize=(16, 12)):
             fano_factors[i] = np.nan
         window_times[i] = time_axis[i + window_size // 2]
 
+    # Agregar overlay de estímulo
+    _add_stimulus_overlay(ax6, result)
     ax6.plot(window_times, fano_factors, lw=2, color="C0")
     ax6.set_xlabel("Time (ms)")
     ax6.set_ylabel("Fano Factor")
@@ -1158,6 +1294,8 @@ def plot_heatmap_activity(result, population='excitatory', figsize=(16, 10),
     # Panel 4: Promedio poblacional en el tiempo
     ax4 = fig.add_subplot(gs[2, 1])
     r_mean_pop = np.mean(r, axis=1)
+    # Agregar overlay de estímulo
+    _add_stimulus_overlay(ax4, result)
     ax4.plot(result.times_, r_mean_pop, lw=2, color='darkblue')
     ax4.fill_between(result.times_,
                      r_mean_pop - np.std(r, axis=1),
@@ -1250,6 +1388,8 @@ def plot_spatial_sampling(result, n_samples=10, figsize=(16, 10),
 
     # Panel 1: Potenciales de membrana - Excitatorias
     ax1 = axes[0, 0]
+    # Agregar overlay de estímulo
+    _add_stimulus_overlay(ax1, result)
     for idx in sample_indices_e:
         # Calcular orientación (0-180° internamente)
         orientation = idx * 180.0 / n_e
@@ -1268,6 +1408,8 @@ def plot_spatial_sampling(result, n_samples=10, figsize=(16, 10),
 
     # Panel 2: Firing rates - Excitatorias
     ax2 = axes[0, 1]
+    # Agregar overlay de estímulo
+    _add_stimulus_overlay(ax2, result)
     for idx in sample_indices_e:
         orientation = idx * 180.0 / n_e
         if orientation_centered:
@@ -1283,6 +1425,8 @@ def plot_spatial_sampling(result, n_samples=10, figsize=(16, 10),
 
     # Panel 3: Potenciales de membrana - Inhibitorias
     ax3 = axes[1, 0]
+    # Agregar overlay de estímulo
+    _add_stimulus_overlay(ax3, result)
     for idx in sample_indices_i:
         orientation = idx * 180.0 / n_i
         if orientation_centered:
@@ -1300,6 +1444,8 @@ def plot_spatial_sampling(result, n_samples=10, figsize=(16, 10),
 
     # Panel 4: Firing rates - Inhibitorias
     ax4 = axes[1, 1]
+    # Agregar overlay de estímulo
+    _add_stimulus_overlay(ax4, result)
     for idx in sample_indices_i:
         orientation = idx * 180.0 / n_i
         if orientation_centered:

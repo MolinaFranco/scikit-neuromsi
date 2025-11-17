@@ -89,6 +89,42 @@ class EchevesteDataLoader:
 
         return params
 
+    def load_input_transformation_parameters(self):
+        """
+        Load optimized input transformation parameters.
+
+        These parameters control the nonlinear transformation of the
+        feed-forward input h:
+            h_transformed = α_h * (h_raw + β_h)^γ_h
+
+        Returns
+        -------
+        params : dict
+            Dictionary containing the 3 optimized input transformation
+            parameters:
+            - alpha_h (α_h): Input scaling = 1.96 (optimized)
+            - beta_h (β_h): Input baseline = 0.10 (optimized)
+            - gamma_h (γ_h): Input power = 2.03 (optimized)
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020), Supplementary Table S1
+        .. [2] ssn_inference_optimizer/train.ml lines 134-136
+        .. [3] ssn_inference_optimizer/objective.ml lines 410-413
+
+        Notes
+        -----
+        These parameters are optimized jointly with the connectivity
+        matrix and noise covariance in the original Echeveste code.
+        The transformation is applied to the raw filter responses
+        before passing them to the SSN.
+        """
+        return {
+            "alpha_h": float(np.loadtxt(self.data_path / "input_scaling")),
+            "beta_h": float(np.loadtxt(self.data_path / "input_baseline")),
+            "gamma_h": float(np.loadtxt(self.data_path / "input_nl_pow")),
+        }
+
     def load_noise_covariance(self):
         """
         Load optimized noise covariance matrix.
@@ -136,11 +172,15 @@ class EchevesteDataLoader:
         Returns
         -------
         dict
-            Dictionary with keys: 'connectivity_params', 'noise_covariance'
+            Dictionary with keys: 'connectivity_params', 'noise_covariance',
+            'input_transformation_params'
         """
         return {
             "connectivity_params": self.load_ssn_connectivity_parameters(),
             "noise_covariance": self.load_noise_covariance(),
+            "input_transformation_params": (
+                self.load_input_transformation_parameters()
+            ),
         }
 
     def load_all_data(self):
@@ -198,6 +238,15 @@ class EchevesteDataLoader:
             if Sigma_eta.shape != (100, 100):
                 return False
 
+            # Test input transformation parameters
+            input_params = self.load_input_transformation_parameters()
+            expected_input_params = ["alpha_h", "beta_h", "gamma_h"]
+            for param in expected_input_params:
+                if param not in input_params:
+                    return False
+                if not isinstance(input_params[param], (int, float)):
+                    return False
+
             return True
 
         except Exception:
@@ -217,14 +266,18 @@ class EchevesteDataLoader:
             C = self.load_prior_covariance()
             params = self.load_ssn_connectivity_parameters()
             Sigma_eta = self.load_noise_covariance()
+            input_params = self.load_input_transformation_parameters()
+
+            total_params = len(params) + len(input_params)
 
             return {
                 "gabor_filters_shape": A.shape,
                 "prior_covariance_shape": C.shape,
                 "connectivity_parameters": list(params.keys()),
+                "input_transformation_parameters": list(input_params.keys()),
                 "noise_covariance_shape": Sigma_eta.shape,
                 "data_source": "Echeveste et al. (2020), Nature Neuroscience",
-                "total_parameters": len(params),
+                "total_parameters": total_params,
             }
         except Exception as e:
             return {"error": str(e)}

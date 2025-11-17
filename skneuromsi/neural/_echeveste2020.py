@@ -73,8 +73,10 @@ class SSNIntegrator:
           exponent
           n = 2.0 produces the required nonlinearity for sampling-based
           inference and k = 0.3 (scaling factor from SSN parameters)
+
+        Note: Uses BrainPy's math backend which supports GPU acceleration.
         """
-        return self.k * np.power(np.maximum(0, u), self.n)
+        return self.k * bp.math.power(bp.math.maximum(0, u), self.n)
 
     def __call__(self, u_e, u_i, t, W, h, eta):
         """
@@ -122,10 +124,11 @@ class SSNIntegrator:
         # IMPORTANTE: W ya contiene los signos correctos (W_EI < 0, W_II < 0)
 
         # Concatenar firing rates para usar con W completa
-        r = np.concatenate([r_e, r_i])  # r_β del término Σ_β W_αβ r_β
+        # Note: Uses BrainPy's math backend for GPU acceleration
+        r = bp.math.concatenate([r_e, r_i])  # r_β del término Σ_β W_αβ r_β
 
         # Aplicar ecuación exacta como en código original: W @ r
-        W_times_r = W @ r  # Σ_β W_αβ r_β (incluye signos correctos)
+        W_times_r = bp.math.matmul(W, r)  # Σ_β W_αβ r_β (signos correctos)
 
         # Para neuronas excitatorias (α ∈ E):
         du_e_dt = (
@@ -216,6 +219,7 @@ class Echeveste2020(SKNMSIMethodABC):
         position_res=None,  # Calculated based on N_E for exact matching
         time_range=(0, 1000),  # Rango temporal de simulación (ms)
         time_res=0.2,  # Paso temporal dt
+        device="auto",  # Device selection: 'cpu', 'gpu', or 'auto'
         **integrator_kws,  # Keywords adicionales para integrador
     ):
         """
@@ -231,10 +235,35 @@ class Echeveste2020(SKNMSIMethodABC):
 
         All default values match the optimized parameters from the paper's
         sampling-based inference optimization procedure.
+
+        Parameters
+        ----------
+        device : {'cpu', 'gpu', 'auto'}, default='auto'
+            Computational device to use:
+            - 'cpu': Force CPU usage
+            - 'gpu': Force GPU usage (requires JAX with CUDA support)
+            - 'auto': Automatically select GPU if available, else CPU
         """
+        # Configurar dispositivo computacional (GPU/CPU)
+        from ._device_config import configure_device
+        self._device_config = configure_device(device)
+
         # Estructura básica de la red
         self._N_E = N_E  # Número de neuronas excitatorias
         self._N_I = N_I  # Número de neuronas inhibitorias
+
+        # Validación: Ring topology del paper asume N_E = N_I
+        # (Ver Supp. Material: "ring of m sites, each with 1E + 1I neuron")
+        # El input feedforward W_ff = [A A]^T requiere N_E = N_I para que
+        # ambas poblaciones reciban la proyección completa de los filtros
+        if self._N_E != self._N_I:
+            raise ValueError(
+                f"Echeveste2020 paper assumes N_E = N_I (ring topology). "
+                f"Got N_E={N_E}, N_I={N_I}. "
+                f"The feedforward input W_ff = [A A]^T / 15.0 requires "
+                f"equal numbers of E and I neurons to properly duplicate "
+                f"the GSM projection h = A.T @ x for both populations."
+            )
 
         # Parámetros de conectividad parametrica - Eq. 10 del paper
         # Stage 1 optimization: optimize these 8 connectivity parameters
@@ -352,10 +381,24 @@ class Echeveste2020(SKNMSIMethodABC):
             - eta: ADAM learning rate (default: 0.002)
             - beta1, beta2: ADAM momentum parameters
             - t_min_initial, t_min_final: annealing range
+            - lambda_mean: cost weight for mean matching
+                (default: 4.0e-5, from Suppl. Table S1)
+            - lambda_var: cost weight for variance matching
+                (default: 8.0e-5, from Suppl. Table S1)
+            - lambda_cov: cost weight for covariance matching
+                (default: 8.0e-7, from Suppl. Table S1)
         stage2_params: dict, optional
             Parameters specific to Stage 2 (L-BFGS-B) optimization:
             - max_iter: number of L-BFGS-B iterations (default: 50)
             - min_time: fixed evaluation window start (default: T_max - 50ms)
+            - lambda_mean: cost weight for mean matching
+                (default: 4.0e-5, from Suppl. Table S1)
+            - lambda_var: cost weight for variance matching
+                (default: 8.0e-5, from Suppl. Table S1)
+            - lambda_cov: cost weight for covariance matching
+                (default: 8.0e-7, from Suppl. Table S1)
+            - lambda_slow: slowness penalty weight
+                (default: 4.0e-8, from Suppl. Table S1, ADF only)
 
         Returns
         -------
@@ -416,7 +459,9 @@ class Echeveste2020(SKNMSIMethodABC):
 
         # Build final connectivity matrices from optimized parameters
         self._build_connectivity_matrices()
-        self._is_trained = True
+
+        # Marcar como entrenado solo si ambos stages fueron completados
+        self._is_trained = self._stage1_completed and self._stage2_completed
 
         print("✓ Training completed successfully")
 
@@ -898,405 +943,323 @@ class Echeveste2020(SKNMSIMethodABC):
 
     def _optimize_stage2(self, gsm_model, params):
         """
-        Stage 2: Optimize using L-BFGS-B with deterministic ADF method.
+        Stage 2: Optimize ALL 15 parameters using L-BFGS-B with ADF method.
+
+        IMPORTANTE: Esta implementación replica EXACTAMENTE el comportamiento
+        de Echeveste et al. (2020), optimizando los 15 parámetros
+        simultáneamente:
+        - 3 input transformation: α_h, β_h, γ_h
+        - 8 connectivity: a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II
+        - 4 noise covariance: width, σ_E, σ_I, ρ
 
         Based on Echeveste et al. (2020) Methods section, page 18:
         "In the second stage, we continued optimization using the L-BFGS-B
         optimizer, now using the ADF method to (deterministically) compute
-        the moments of the network's response distribution. We kept the
-        cost-integration time window at its minimum (T_max - T_min = 50 ms,
-        as reached by the end of the first phase)."
+        the moments of the network's response distribution."
 
-        Key differences from Stage 1:
+        Key characteristics:
         1. L-BFGS-B optimizer (quasi-Newton method)
         2. Deterministic ADF method (no sampling, N_trial = None)
         3. Fixed time window: T_min = T_max - 50ms
-        4. Can include slowness penalty cost (lambda_slow)
-
-        This stage optimizes network noise covariance parameters while
-        keeping connectivity parameters fixed from Stage 1.
+        4. Slowness penalty cost (lambda_slow)
+        5. Optimizes ALL 15 parameters (unlike Stage 1)
+        6. Reuses Stage 1 results as initialization for connectivity params
 
         Parameters
         ----------
         gsm_model: object
-            Pre-trained GSM generative model
+        Pre-trained GSM generative model
         params: dict
-            Stage 2 specific parameters
+        Stage 2 specific parameters
 
         Returns
         -------
         dict
-            Optimization results for Stage 2
+        Optimization results for Stage 2
 
         References
         ----------
         .. [1] Echeveste et al. (2020) Nature Neuroscience, Methods page 18
         .. [2] ssn_inference_optimizer/train.ml lines 249-278
+        .. [3] ssn_inference_optimizer/objective.ml lines 101-105 (n_prms=15)
         """
         from scipy.optimize import minimize
-        from ._echeveste_training import compute_evolution_costs
+        from ._echeveste_training import create_objective_function
         import jax.numpy as jnp
+        import numpy as np
 
         # Parámetros por defecto de Stage 2
-        # Basado en objective.ml líneas 174-179 (sigma_eta_prms)
         if params is None:
             params = {}
 
+        print("="*70)
+        print("STAGE 2: L-BFGS-B with ADF (15 parameters)")
+        print("="*70)
+
         # Parámetros de optimización
-        max_iter = params.get('max_iter', 250)  # train.ml default: 1000
+        max_iter = params.get('max_iter', 250)
         dt = params.get('dt', 0.2e-3)
         t_max = params.get('t_max', 0.1)
         t_subsamp = params.get('t_subsamp', 10.0e-3)
-        min_time = params.get('min_time', 0.05)  # 50ms evaluation window
+        min_time = params.get('min_time', 0.05)
+
+        # Parámetros de costo (multiplicadores pre-normalización)
+        # Ref: train.ml lines 36-39, objective.ml:110-113
         lambda_mean = params.get('lambda_mean', 1.0)
-        lambda_var = params.get('lambda_var', 1.0)
+        lambda_var = params.get('lambda_var', 2.0)
         lambda_cov = params.get('lambda_cov', 1.0)
-        lambda_slow = params.get('lambda_slow', 0.0)  # Default 0, can use 0.1
+        lambda_slow = params.get('lambda_slow', 0.01)
 
-        # Inicializar parámetros de ruido
-        # objective.ml lines 174-179
-        initial_noise_params = {
-            'width': params.get('noise_width', 0.8),
-            'std_e': params.get('noise_std_e', 2.0),
-            'std_i': params.get('noise_std_i', 2.0),
-            'rho': params.get('noise_rho', 0.8),
-        }
+        print("\nOptimization parameters:")
+        print(f"  max_iter: {max_iter}")
+        print(f"  dt: {dt} s")
+        print(f"  t_max: {t_max} s")
+        print(f"  min_time: {min_time} s")
+        print(f"  lambda weights: mean={lambda_mean}, var={lambda_var}, "
+              f"cov={lambda_cov}, slow={lambda_slow}")
 
-        print("Stage 2: Optimizing noise covariance parameters...")
-        print(f"Initial noise params: {initial_noise_params}")
-        print(f"Max iterations: {max_iter}")
-
-        # Extraer targets del GSM (reutilizar del Stage 1 si está disponible)
+        # PASO 1: Generar targets del GSM con h_vec RAW
+        # ================================================
+        print("\nGenerating GSM targets (apply_transformation=False)...")
         contrast = params.get('contrast', 0.5)
         n_samples_gsm = params.get('n_samples_gsm', 50)
 
-        print("Computing GSM posterior targets for Stage 2...")
         gsm_data = gsm_model.compute_posterior_for_ssn_training(
             contrast=contrast,
-            n_samples=n_samples_gsm
+            n_samples=n_samples_gsm,
+            apply_transformation=False  # ← Clave: obtener h_vec raw
         )
 
-        # Ajustar h_vec al tamaño de la red (mismo que Stage 1)
-        # Duplicar input para neuronas E e I (ver generalization.py:116)
-        h_full = gsm_data['h_inputs'].mean(axis=0)
-        h_e = h_full[:self._N_E]  # Primeras N_E para excitatorias
-        h_i = h_e[:self._N_I]     # Duplicar para inhibitorias (mismo input)
-        h_vec = jnp.concatenate([h_e, h_i])  # Shape: (N_E + N_I,)
+        print(f"  Generated {n_samples_gsm} samples at contrast={contrast}")
+        print(f"  h_inputs shape: {gsm_data['h_inputs'].shape}")
 
-        # Ajustar targets al tamaño de la red
-        target_mu = jnp.array(gsm_data['target_mu'][:self._N_E])
-        target_sigma = jnp.array(
-            gsm_data['target_sigma'][:self._N_E, :self._N_E]
-        )
+        # PASO 2: Inicializar los 15 parámetros
+        # ========================================
+        print("\nInitializing 15 parameters...")
 
-        # Construir inverse time constants
-        inv_taus = jnp.concatenate([
-            jnp.full(self._N_E, 1.0 / self._integrator.f.tau_e),
-            jnp.full(self._N_I, 1.0 / self._integrator.f.tau_i)
-        ])
+        # 2a. Input transformation parameters (train.ml:93-95)
+        input_baseline_lb = gsm_model.compute_input_baseline_lb(n_samples=100)
+        print(f"  Computed input_baseline_lb: {input_baseline_lb:.6f}")
 
-        # Matriz W ya optimizada en Stage 1
-        # Si Stage 1 no se ejecutó, usar parámetros default
-        if not self._stage1_completed:
-            print("Warning: Stage 1 not completed, using default connectivity")
-            default_conn_params = {
-                'a_EE': 0.02, 'a_EI': 0.02,
-                'a_IE': 0.02, 'a_II': 0.02,
-                'd_EE': 0.8, 'd_EI': 0.8,
-                'd_IE': 0.8, 'd_II': 0.8,
-            }
-            W_fixed = self.build_connectivity_matrix(default_conn_params)
+        initial_params = {}
+
+        # Valores iniciales de transformación
+        initial_params['input_baseline'] = input_baseline_lb + 1.0  # ~1.6
+        initial_params['input_scaling'] = 1.0
+        initial_params['input_nl_pow'] = 1.0
+
+        # 2b. Connectivity parameters
+        # Si Stage 1 completado: usar resultados
+        # Si no: usar defaults (objective.ml:92-94)
+        if self._stage1_completed and hasattr(self, '_connectivity_params'):
+            # Reusar parámetros de Stage 1
+            conn_params = self._connectivity_params
+            print("  Reusing connectivity from Stage 1:")
         else:
-            W_fixed = self.build_connectivity_matrix()
+            # Usar defaults
+            conn_params = {
+                'a_EE': 0.02, 'a_EI': 0.02, 'a_IE': 0.02, 'a_II': 0.02,
+                'd_EE': 0.8, 'd_EI': 0.8, 'd_IE': 0.8, 'd_II': 0.8,
+            }
+            print("  Using default connectivity (Stage 1 not completed):")
 
-        def pack_noise_parameters(noise_params):
-            """
-            Pack noise parameters into optimization vector.
+        initial_params.update(conn_params)
 
-            Based on objective.ml lines 205-211.
-            Parámetros de ruido: width, std_e, std_i, rho
-            """
-            # Transformaciones para garantizar positividad y bounds
-            x = np.zeros(4)
-            x[0] = noise_params['width']  # width (directo)
-            x[1] = noise_params['std_e']  # std_e (directo)
-            x[2] = noise_params['std_i']  # std_i (directo)
-            # rho ∈ (0,1): usar transformación tanh inversa
-            # rho = 0.5 * (1 + tanh(x)) => x = atanh(2*rho - 1)
-            rho = noise_params['rho']
-            if rho <= 0.01:
-                rho = 0.01
-            if rho >= 0.99:
-                rho = 0.99
-            z = 2.0 * rho - 1.0
-            x[3] = 0.5 * (np.log(1.0 + z) - np.log(1.0 - z))
-            return x
+        # 2c. Noise parameters (objective.ml:174-179)
+        initial_params['sigma_eta_width'] = params.get('noise_width', 0.8)
+        initial_params['sigma_eta_std_e'] = params.get('noise_std_e', 2.0)
+        initial_params['sigma_eta_std_i'] = params.get('noise_std_i', 2.0)
+        initial_params['sigma_eta_rho'] = params.get('noise_rho', 0.8)
 
-        def unpack_noise_parameters(x):
-            """Unpack optimization vector to noise parameters."""
-            noise_params = {}
-            noise_params['width'] = x[0]
-            noise_params['std_e'] = x[1]
-            noise_params['std_i'] = x[2]
-            # rho = 0.5 * (1 + tanh(x[3]))
-            # IMPORTANTE: Usar jnp.tanh para que sea diferenciable por JAX
-            noise_params['rho'] = 0.5 * (1.0 + jnp.tanh(x[3]))
-            return noise_params
+        # Imprimir valores iniciales
+        print("\n  Input transformation:")
+        print(f"    α_h = {initial_params['input_scaling']:.4f}")
+        print(f"    β_h = {initial_params['input_baseline']:.4f}")
+        print(f"    γ_h = {initial_params['input_nl_pow']:.4f}")
+        print("  Connectivity (sample):")
+        print(f"    a_EE = {initial_params['a_EE']:.4f}")
+        print(f"    d_EE = {initial_params['d_EE']:.4f}")
+        print("  Noise:")
+        print(f"    width = {initial_params['sigma_eta_width']:.4f}")
+        print(f"    σ_E = {initial_params['sigma_eta_std_e']:.4f}")
+        print(f"    σ_I = {initial_params['sigma_eta_std_i']:.4f}")
+        print(f"    ρ = {initial_params['sigma_eta_rho']:.4f}")
 
-        def build_sigma_eta_jax(width, std_e, std_i, rho):
-            """Construir Σ_η con JAX."""
-            var_e = std_e ** 2
-            var_i = std_i ** 2
+        # PASO 3: Crear función objetivo con 15 parámetros
+        # ==================================================
+        print("\nCreating objective function (15 parameters)...")
 
-            theta = jnp.linspace(0, jnp.pi, self._N_E, endpoint=False)
-            delta = theta[:, None] - theta[None, :]
-
-            # Kernel espacial
-            spatial_kernel = jnp.exp(
-                (jnp.cos(delta) - 1) / (width**2)
+        objective_fn, gradient_fn, pack_fn, unpack_fn = \
+            create_objective_function(
+                gsm_model,
+                self._N_E,
+                self._N_I,
+                self._integrator.f.tau_e,
+                self._integrator.f.tau_i,
+                self._integrator.f.tau_n,
+                self._integrator.f.k,
+                dt,
+                t_max,
+                t_subsamp,
+                min_time,
+                lambda_mean,
+                lambda_var,
+                lambda_cov
             )
 
-            # Construir bloques
-            Sigma_ee = var_e * spatial_kernel
-            Sigma_ii = var_i * spatial_kernel
-            Sigma_ei = rho * jnp.sqrt(var_e * var_i) * spatial_kernel
+        print("  ✓ Objective function created")
+        print("  ✓ Gradient function (JAX autodiff)")
+        print("  ✓ Pack/unpack functions for 15 parameters")
 
-            # Ensamblar matriz completa
-            Sigma_eta = jnp.block([
-                [Sigma_ee, Sigma_ei],
-                [Sigma_ei.T, Sigma_ii]
-            ])
+        # PASO 4: Pack parámetros iniciales
+        # ===================================
+        x0 = pack_fn(initial_params)
+        print(f"\n  Packed parameters: x0.shape = {x0.shape}")
 
-            # Agregar término diagonal para estabilidad
-            Sigma_eta = Sigma_eta + 0.01 * jnp.eye(self._N)
+        # PASO 5: Configurar bounds (objective.ml:216-237)
+        # =================================================
+        print("\nConfiguring bounds for 15 parameters...")
 
-            return Sigma_eta
-
-        # Pack parámetros iniciales
-        x0 = pack_noise_parameters(initial_noise_params)
-
-        # Bounds para Stage 2 (objective.ml lines 234-237)
+        # Bounds específicos según objective.ml
+        sqrt2 = np.sqrt(2.0)
         bounds = [
-            (0.01, np.sqrt(2.0)),  # width ∈ (0, √2)
-            (0.1, 4.0),            # std_e ∈ (0.1, 4)
-            (0.1, 4.0),            # std_i ∈ (0.1, 4)
-            (-5.0, 5.0),           # rho_transformed ∈ (-∞, ∞)
+            # Input transformation (0-2)
+            (0.0, None),              # input_baseline - lb (≥ 0)
+            (0.0, None),              # input_scaling (≥ 0)
+            (0.0, None),              # input_nl_pow (≥ 0)
+            # Weight heights (3-6)
+            (0.0, None),              # a_EE - 0.01 (≥ 0)
+            (0.0, None),              # a_EI - 0.01
+            (0.0, None),              # a_IE - 0.01
+            (0.0, None),              # a_II - 0.01
+            # Weight widths (7-10)
+            (0.01, sqrt2),            # d_EE ∈ (0, √2)
+            (0.01, sqrt2),            # d_EI
+            (0.01, sqrt2),            # d_IE
+            (0.01, sqrt2),            # d_II
+            # Noise parameters (11-14)
+            (0.01, sqrt2),            # width ∈ (0, √2)
+            (0.1, 4.0),               # std_e ∈ (0.1, 4)
+            (0.1, 4.0),               # std_i ∈ (0.1, 4)
+            (-5.0, 5.0),              # rho_transformed ∈ (-∞, ∞)
         ]
 
-        # Función objetivo con gradientes JAX
-        # Mismo patrón que Stage 1: gradientes analíticos son más precisos
-        import jax
+        print(f"  Configured {len(bounds)} bounds")
 
-        def objective_jax(x):
-            """Calcular costo (versión JAX pura para autodiff)."""
-            noise_params = unpack_noise_parameters(x)
+        # PASO 6: Wrappers para scipy
+        # =============================
+        def objective_scipy(x):
+            """Wrapper que retorna float para scipy."""
+            return float(objective_fn(jnp.array(x)))
 
-            # Construir Σ_η con parámetros actuales
-            sigma_eta = build_sigma_eta_jax(
-                noise_params['width'],
-                noise_params['std_e'],
-                noise_params['std_i'],
-                noise_params['rho']
-            )
+        def gradient_scipy(x):
+            """Wrapper que retorna np.array para scipy."""
+            return np.array(gradient_fn(jnp.array(x)))
 
-            # Calcular costo usando ADF
-            # Ref: objective.ml:464-467 (includes slowness cost)
-            cost, _, _ = compute_evolution_costs(
-                jnp.array(W_fixed), h_vec, sigma_eta, inv_taus,
-                dt, self._integrator.f.tau_n, t_max, t_subsamp,
-                target_mu, target_sigma, self._integrator.f.k,
-                lambda_mean, lambda_var, lambda_cov, lambda_slow,
-                min_time
-            )
+        # PASO 7: Optimización L-BFGS-B
+        # ==============================
+        print("\nStarting L-BFGS-B optimization...")
+        print(f"  Initial cost: {objective_scipy(x0):.6f}")
 
-            # Manejar NaN/Inf
-            cost = jnp.where(
-                jnp.isfinite(cost),
-                cost,
-                1e10
-            )
-
-            return cost  # Mantener como JAX array para autodiff
-
-        # Calcular gradiente usando JAX
-        grad_fn = jax.grad(objective_jax)
-
-        def objective(x):
-            """Wrapper para scipy (retorna float)."""
-            return float(objective_jax(jnp.array(x)))
-
-        def gradient(x):
-            """Gradiente analítico usando JAX."""
-            g = grad_fn(jnp.array(x))
-            return np.array(g)
-
-        # Optimización usando L-BFGS-B con parámetros del código original
-        # Ref: train.ml:269
-        # - corrections=20: mantener 20 correcciones en memoria
-        #   (historia Hessiano)
-        # - ftol=1e-10: tolerancia función (factr=1E1 → ftol ≈ 1e-10)
-        # - gtol=1e-8: tolerancia gradiente (pgtol=0, usamos pequeño)
         lbfgs_options = {
             'maxiter': max_iter,
             'disp': True,
-            'maxcor': 20,      # corrections: history size for Hessian approx
-            'ftol': 1e-10,     # function tolerance
-            'gtol': 1e-8,      # gradient tolerance (original uses pgtol=0)
+            'maxcor': 20,        # Hessian history size
+            'ftol': 1e-10,       # Function tolerance
+            'gtol': 1e-8,        # Gradient tolerance
         }
 
-        # Parámetros de recovery
-        max_recovery_attempts = params.get('max_recovery_attempts', 10)
-        recovery_step_size = params.get('recovery_step_size', 0.001)
+        result = minimize(
+            objective_scipy,
+            x0,
+            method='L-BFGS-B',
+            jac=gradient_scipy,
+            bounds=bounds,
+            options=lbfgs_options
+        )
 
-        # Recovery Mechanism (train.ml:268-277)
-        # Si L-BFGS falla, hacer mini gradient step y reintentar
-        def attempt_optimization(x_current, attempt_num):
-            """
-            Attempt L-BFGS optimization with recovery mechanism.
-
-            Si falla, toma mini gradient step y reintenta recursivamente.
-
-            Ref: train.ml lines 268-277
-            ```ocaml
-            let rec attempt () =
-              try Lbfgs.(...) |> ignore
-              with _ -> begin
-                  save_results x "failed";
-                  let _, g = fdf x in
-                  Vec.sub ~z:x x F.(0.001 *.:| g) |> ignore;
-                  attempt ()
-                end
-            in attempt ()
-            ```
-            """
-            print(f"\n{'='*60}")
-            print(f"L-BFGS Attempt {attempt_num}/{max_recovery_attempts}")
-            print(f"{'='*60}")
-
-            try:
-                # Intentar L-BFGS-B optimization
-                result = minimize(
-                    objective,
-                    x_current,
-                    method='L-BFGS-B',
-                    jac=gradient,
-                    bounds=bounds,
-                    options=lbfgs_options
-                )
-
-                # Si converge exitosamente, retornar
-                if result.success:
-                    print("\n✓ L-BFGS converged successfully")
-                    return result, False  # (result, used_recovery)
-
-                # Si termina sin success flag pero sin excepción
-                # Considerar como falla soft
-                msg = result.message
-                print(f"\n⚠ L-BFGS finished but not successful: {msg}")
-
-                # Si alcanzamos max attempts, retornar falla
-                if attempt_num >= max_recovery_attempts:
-                    print("✗ Max recovery attempts reached")
-                    return result, True
-
-                # Recovery: mini gradient step
-                raise RuntimeError(f"L-BFGS failed: {result.message}")
-
-            except Exception as e:
-                print(f"\n✗ L-BFGS failed: {str(e)[:100]}")
-
-                # Si alcanzamos max attempts, retornar último resultado
-                if attempt_num >= max_recovery_attempts:
-                    print("✗ Max recovery attempts reached, "
-                          "returning last state")
-                    # Crear resultado dummy
-                    from scipy.optimize import OptimizeResult
-                    return OptimizeResult(
-                        x=x_current,
-                        success=False,
-                        message="Max recovery attempts reached",
-                        fun=objective(x_current),
-                        nit=0,
-                        nfev=0
-                    ), True
-
-                # Recovery mechanism: mini gradient descent step
-                # Ref: train.ml:273-274
-                print(f"→ Taking mini gradient step (α={recovery_step_size})")
-
-                # Calcular gradiente en x_current
-                try:
-                    grad = gradient(x_current)
-                except Exception as grad_e:
-                    print(f"✗ Gradient computation failed: {grad_e}")
-                    # Si gradient falla, perturbar aleatoriamente
-                    grad = np.random.randn(len(x_current)) * 0.01
-
-                # Mini step: x ← x - α·∇f(x)
-                # Ref: train.ml:274
-                x_new = x_current - recovery_step_size * grad
-
-                # Proyectar a bounds
-                for i, (lb, ub) in enumerate(bounds):
-                    x_new[i] = np.clip(x_new[i], lb, ub)
-
-                grad_norm = np.linalg.norm(grad)
-                step_size = recovery_step_size * grad_norm
-                print(f"   Gradient norm: {grad_norm:.6e}")
-                print(f"   Step size: {step_size:.6e}")
-
-                # Reintentar recursivamente
-                return attempt_optimization(x_new, attempt_num + 1)
-
-        # Comenzar optimización con recovery mechanism
-        result, used_recovery = attempt_optimization(x0, attempt_num=1)
-
-        # Desempaquetar parámetros optimizados
-        optimized_noise_params = unpack_noise_parameters(result.x)
-
-        # Solo actualizar matriz Σ_η si fue exitoso
-        if result.success:
-            self._Sigma_eta = self._build_noise_covariance(
-                optimized_noise_params['width'],
-                optimized_noise_params['std_e'],
-                optimized_noise_params['std_i'],
-                optimized_noise_params['rho']
-            )
-
-        # NOTA: NO marcar _stage2_completed aquí, se marca en train()
-        # solo si result.success == True
-
-        print("\nStage 2 optimization finished:")
+        # PASO 8: Procesar resultados
+        # =============================
+        print("\nOptimization complete:")
         print(f"  Success: {result.success}")
-        print(f"  Used recovery: {used_recovery}")
+        print(f"  Message: {result.message}")
         print(f"  Final cost: {result.fun:.6f}")
         print(f"  Iterations: {result.nit}/{max_iter}")
-        print(f"  Message: {result.message}")
-        print(f"  width: {initial_noise_params['width']:.4f} → "
-              f"{optimized_noise_params['width']:.4f}")
-        print(f"  std_e: {initial_noise_params['std_e']:.4f} → "
-              f"{optimized_noise_params['std_e']:.4f}")
-        print(f"  std_i: {initial_noise_params['std_i']:.4f} → "
-              f"{optimized_noise_params['std_i']:.4f}")
-        print(f"  rho:   {initial_noise_params['rho']:.4f} → "
-              f"{optimized_noise_params['rho']:.4f}")
+        print(f"  Function evaluations: {result.nfev}")
 
-        return {
-            'optimized_params': optimized_noise_params,
-            'initial_params': initial_noise_params,
-            'final_cost': float(result.fun),
-            'n_iterations': int(result.nit),
-            'max_iterations': max_iter,
-            'sigma_eta_shape': (
-                self._Sigma_eta.shape if result.success else None
-            ),
-            'success': bool(result.success),
-            'used_recovery': used_recovery,
-            'message': str(result.message),
-            'nfev': int(result.nfev),
-            'njev': int(result.njev) if hasattr(result, 'njev') else None,
-            'lambda_slow': lambda_slow,
-        }
+        # Unpack parámetros optimizados
+        optimized_params = unpack_fn(result.x)
+
+        # Comparar inicial vs final
+        print("\nParameter changes:")
+        print("  Input transformation:")
+        print(f"    α_h: {initial_params['input_scaling']:.4f} → "
+              f"{optimized_params['input_scaling']:.4f}")
+        print(f"    β_h: {initial_params['input_baseline']:.4f} → "
+              f"{optimized_params['input_baseline']:.4f}")
+        print(f"    γ_h: {initial_params['input_nl_pow']:.4f} → "
+              f"{optimized_params['input_nl_pow']:.4f}")
+
+        print("  Connectivity (sample):")
+        print(f"    a_EE: {initial_params['a_EE']:.4f} → "
+              f"{optimized_params['a_EE']:.4f}")
+        print(f"    d_EE: {initial_params['d_EE']:.4f} → "
+              f"{optimized_params['d_EE']:.4f}")
+
+        print("  Noise:")
+        print(f"    width: {initial_params['sigma_eta_width']:.4f} → "
+              f"{optimized_params['sigma_eta_width']:.4f}")
+        print(f"    σ_E: {initial_params['sigma_eta_std_e']:.4f} → "
+              f"{optimized_params['sigma_eta_std_e']:.4f}")
+        print(f"    σ_I: {initial_params['sigma_eta_std_i']:.4f} → "
+              f"{optimized_params['sigma_eta_std_i']:.4f}")
+        print(f"    ρ: {initial_params['sigma_eta_rho']:.4f} → "
+              f"{optimized_params['sigma_eta_rho']:.4f}")
+
+        # PASO 9: Actualizar modelo si exitoso
+        # ======================================
+        if result.success:
+            # Actualizar conectividad
+            self._connectivity_params = {
+                'a_EE': optimized_params['a_EE'],
+                'a_EI': optimized_params['a_EI'],
+                'a_IE': optimized_params['a_IE'],
+                'a_II': optimized_params['a_II'],
+                'd_EE': optimized_params['d_EE'],
+                'd_EI': optimized_params['d_EI'],
+                'd_IE': optimized_params['d_IE'],
+                'd_II': optimized_params['d_II'],
+            }
+            self._W = self.build_connectivity_matrix(self._connectivity_params)
+
+            # Actualizar noise covariance
+            self._Sigma_eta = self._build_noise_covariance(
+                optimized_params['sigma_eta_width'],
+                optimized_params['sigma_eta_std_e'],
+                optimized_params['sigma_eta_std_i'],
+                optimized_params['sigma_eta_rho']
+            )
+
+            print("\n✓ Model parameters updated successfully")
+        else:
+            print("\n✗ Optimization failed, parameters NOT updated")
+
+            # PASO 10: Retornar resultados
+            # =============================
+            return {
+                'optimized_params': optimized_params,
+                'initial_params': initial_params,
+                'final_cost': float(result.fun),
+                'initial_cost': float(objective_scipy(x0)),
+                'n_iterations': int(result.nit),
+                'max_iterations': max_iter,
+                'success': bool(result.success),
+                'message': str(result.message),
+                'nfev': int(result.nfev),
+                'optimizer': 'L-BFGS-B',
+                'n_parameters': 15,
+                'lambda_slow': lambda_slow,
+            }
 
     def _build_noise_covariance(self, width, std_e, std_i, rho):
         """
@@ -1837,9 +1800,82 @@ class Echeveste2020(SKNMSIMethodABC):
         stimulus_orientation=0.0,  # Orientación del estímulo G en GSM
         noise_level=0.1,  # Nivel de ruido η para inferencia
         simulation_time=1000.0,  # Tiempo de simulación en ms
+        # Parámetros para estructura de tres fases (transientes)
+        use_three_phases=False,  # Si True, usa transientes como código orig
+        t_init=225.0,  # ms: Pre-stimulus spontaneous activity
+        t_stimulus=100.0,  # ms: Stimulus presentation duration
+        t_final=125.0,  # ms: Post-stimulus spontaneous activity
+        use_delays=False,  # Si True, usa delays por neurona en transiciones
+        mean_delay=45.0,  # ms: Delay promedio para transiciones
+        delay_sd=5.0,  # ms: Desviación estándar de delays
         **kwargs,  # Parámetros adicionales
     ):
-        """Run the SSN simulation."""
+        """
+        Run the SSN simulation.
+
+        Following Echeveste et al. (2020), this method supports two modes:
+
+        1. **Single-phase mode** (use_three_phases=False, default):
+           - Stimulus present throughout entire simulation
+           - Used for steady-state analysis and training validation
+           - Consistent with training procedure (objective.ml)
+
+        2. **Three-phase mode** (use_three_phases=True):
+           - Phase 1: Spontaneous activity (no stimulus, duration t_init)
+           - Phase 2: Stimulus presentation (duration t_stimulus)
+           - Phase 3: Post-stimulus spontaneous (no stimulus, duration t_final)
+           - Used for transient dynamics and temporal response analysis
+           - Consistent with simulation code (transients.py)
+           - Optionally supports per-neuron delays in stimulus transitions
+
+        Parameters
+        ----------
+        stimulus_contrast : float, default=0.019
+            Contrast z of the GSM stimulus (Main paper Eq. 1-7)
+        stimulus_orientation : float, default=0.0
+            Orientation G of the GSM stimulus (radians)
+        noise_level : float, default=0.1
+            Noise level η for inference
+        simulation_time : float, default=1000.0
+            Total simulation time in ms (for single-phase mode)
+            Ignored in three-phase mode (uses t_init+t_stimulus+t_final)
+        use_three_phases : bool, default=False
+            If True, uses three-phase temporal structure (transients)
+            If False, uses single-phase with constant stimulus (training)
+        t_init : float, default=225.0
+            Duration of pre-stimulus spontaneous activity in ms
+            (Only used if use_three_phases=True)
+            Reference: transients.py line 41
+        t_stimulus : float, default=100.0
+            Duration of stimulus presentation in ms
+            (Only used if use_three_phases=True)
+            Reference: transients.py line 42
+        t_final : float, default=125.0
+            Duration of post-stimulus spontaneous activity in ms
+            (Only used if use_three_phases=True)
+            Reference: transients.py line 43
+        use_delays : bool, default=False
+            If True, applies per-neuron delays in stimulus transitions
+            (Only used if use_three_phases=True)
+            Reference: transients.py lines 50-60, methods.py:746-776
+        mean_delay : float, default=45.0
+            Mean delay time for stimulus arrival at neurons in ms
+            Reference: transients.py line 51
+        delay_sd : float, default=5.0
+            Standard deviation of delays in ms
+            Reference: transients.py line 52
+
+        Returns
+        -------
+        dict
+            Simulation results with firing rates and membrane potentials
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Nature Neuroscience
+        .. [2] ssn_inference_numerical_experiments/SSN/transients.py
+        .. [3] ssn_inference_optimizer/objective.ml
+        """
         # Verificar que el modelo esté entrenado antes de la simulación
         if not self.is_trained():
             raise ValueError(
@@ -1848,36 +1884,45 @@ class Echeveste2020(SKNMSIMethodABC):
             )
 
         try:
-            # Generate GSM stimulus following Echeveste et al. (2020)
+            # Generate stimuli following Echeveste et al. (2020)
             # Mathematical foundation:
             # - Main paper, Eq. 1-7: I = z * G where z is contrast,
             # G is oriented field
             # - Main paper, Section 2.1: "Gaussian Scale Mixture (GSM) model"
             # - Supplementary Material:
             # "Visual input through GSM generative model"
-            #
-            # Justification for re-enabling GSM:
-            # 1. All numerical instabilities have been fixed:
-            #    - Time constants corrected (tau_e=20ms, tau_i=10ms)
-            #    - Exact connectivity matrix loaded (w_learn)
-            #    - Proper supralinear activation function
-            # 2. GSM is the authentic stimulus model from the paper
-            # 3. Required for proper causal inference testing
 
-            stimulus = self._generate_gsm_stimulus(
+            # Generar estímulo con contraste (h_final en código original)
+            # Reference: transients.py lines 97-102
+            h_stimulus = self._generate_gsm_stimulus(
                 stimulus_contrast,
-                stimulus_orientation,  # GSM model parameters
+                stimulus_orientation,
             )
 
-            # Fallback option for debugging (can be enabled if needed)
-            # stimulus = self._generate_simple_stimulus(stimulus_contrast)
+            # Generar baseline para actividad espontánea
+            # (h_0 en código original)
+            # Reference: transients.py lines 88, 93
+            # En el código original, h_0 corresponde al estímulo para
+            # contrast=0 que representa actividad espontánea sin estímulo
+            # visual
+            h_baseline = self._generate_gsm_stimulus(
+                0.0,  # Contraste cero para actividad espontánea
+                0.0,  # Orientación irrelevante para contraste cero
+            )
 
             # Validate stimulus dimensions
             expected_stimulus_size = self._N_E + self._N_I
-            if len(stimulus) != expected_stimulus_size:
+            if len(h_stimulus) != expected_stimulus_size:
                 raise ValueError(
                     f"Stimulus dimension mismatch. Expected "
-                    f"{expected_stimulus_size}, got {len(stimulus)}. "
+                    f"{expected_stimulus_size}, got {len(h_stimulus)}. "
+                    f"Network: {self._N_E}E + {self._N_I}I = "
+                    f"{expected_stimulus_size} total."
+                )
+            if len(h_baseline) != expected_stimulus_size:
+                raise ValueError(
+                    f"Baseline dimension mismatch. Expected "
+                    f"{expected_stimulus_size}, got {len(h_baseline)}. "
                     f"Network: {self._N_E}E + {self._N_I}I = "
                     f"{expected_stimulus_size} total."
                 )
@@ -1967,33 +2012,94 @@ class Echeveste2020(SKNMSIMethodABC):
         # (código original methods.py:398)
         # Permite generar η~N(0,Sigma_eta) a partir de
         # z~N(0,I) mediante η = L @ z
-        L = np.linalg.cholesky(Sigma_eta)
-
-        # correlación temporal del ruido η(t)
-        # Main paper Eq. 11: ⟨η(t) η(t + s)^T⟩ = Σ_η exp(−s/τ_η)
-        # Implementación temporal siguiendo código original methods.py:402-403
-
+        #
+        # Tiempo de resolución (necesario para three_phases incluso sin ruido)
         dt = self._time_res / 1000.0  # Convierte ms a segundos
-        tau_n_inv = (
-            1.0 / self._integrator.f.tau_n
-        )  # τ_η^(-1), con τ_η = 0.02s (20ms, Table S1)
 
-        # Coeficientes para actualización temporal
-        # (código original methods.py:402-403)
-        eps_1 = 1.0 - dt * tau_n_inv  # Aproximación e^(-dt/τ_η) ≈ 1-dt/τ_η
-        eps_2 = np.sqrt(
-            2.0 * dt * tau_n_inv
-        )  # Factor para mantener varianza estacionaria
+        # IMPORTANTE: Solo calcular si noise_level > 0
+        # Si noise_level = 0, Sigma_eta es matriz de ceros
+        # y Cholesky falla (no es definida positiva)
+        if noise_level > 0:
+            L = np.linalg.cholesky(Sigma_eta)
 
-        # CONDICIÓN INICIAL: η(t=0)~N(0,Σᶯ) según Main paper Eq. 11
-        eta_0 = self._random.multivariate_normal(np.zeros(self._N), Sigma_eta)
+            # correlación temporal del ruido η(t)
+            # Main paper Eq. 11: ⟨η(t) η(t + s)^T⟩ = Σ_η exp(−s/τ_η)
+            # Implementación temporal siguiendo código original
+            # methods.py:402-403
+
+            tau_n_inv = (
+                1.0 / self._integrator.f.tau_n
+            )  # τ_η^(-1), con τ_η = 0.02s (20ms, Table S1)
+
+            # Coeficientes para actualización temporal
+            # (código original methods.py:402-403)
+            # Aproximación e^(-dt/τ_η) ≈ 1-dt/τ_η
+            eps_1 = 1.0 - dt * tau_n_inv
+            # Factor para mantener varianza estacionaria
+            eps_2 = np.sqrt(2.0 * dt * tau_n_inv)
+
+            # CONDICIÓN INICIAL: η(t=0)~N(0,Σᶯ) según Main paper Eq. 11
+            eta_0 = self._random.multivariate_normal(
+                np.zeros(self._N), Sigma_eta
+            )
+        else:
+            # Sin ruido: η = 0 para todo tiempo
+            L = None
+            eps_1 = 0.0
+            eps_2 = 0.0
+            eta_0 = np.zeros(self._N)
 
         # Implementa loop temporal como en network_evolution()
         # del código original, Main paper
         # Eq. 8: τ_α * du_α/dt = -u_α + Σ_β W_αβ r_β + h_α + η_α
 
-        # Tiempo de simulación para alcanzar steady-state (Main paper Fig. 3)
-        simulation_steps = int(simulation_time / self._time_res)
+        # Determinar estructura temporal según modo
+        if use_three_phases:
+            # Modo tres fases (transients.py lines 41-43)
+            steps_init = int(t_init / self._time_res)
+            steps_stimulus = int(t_stimulus / self._time_res)
+            steps_final = int(t_final / self._time_res)
+            simulation_steps = steps_init + steps_stimulus + steps_final
+            total_time_ms = t_init + t_stimulus + t_final
+
+            # Generar delays si se solicitan (transients.py lines 50-60)
+            if use_delays:
+                # Delays en segundos, siguiendo código original
+                mean_delay_sec = mean_delay / 1000.0
+                delay_sd_sec = delay_sd / 1000.0
+
+                # Generar delays para neuronas excitatorias
+                delays = self._random.normal(
+                    mean_delay_sec, delay_sd_sec, self._N_E
+                )
+                delays[delays < 0] = 0.0  # No delays negativos
+
+                # Duplicar para inhibitorias (mismo delay que excitatorias)
+                delays = np.concatenate((delays, delays))
+
+                print("Using per-neuron delays: "
+                      f"mean={mean_delay}ms, sd={delay_sd}ms")
+            else:
+                delays = np.zeros(self._N)
+        else:
+            # Modo single-phase (objetivo: training)
+            simulation_steps = int(simulation_time / self._time_res)
+            total_time_ms = simulation_time
+            # En single-phase, no hay fases ni delays
+            steps_init = 0
+            steps_stimulus = simulation_steps
+            steps_final = 0
+            delays = np.zeros(self._N)
+
+        print(f"Simulation: {total_time_ms:.1f}ms "
+              f"({simulation_steps} steps)")
+        if use_three_phases:
+            print(f"  Phase 1 (spontaneous): {t_init:.1f}ms "
+                  f"({steps_init} steps)")
+            print(f"  Phase 2 (stimulus): {t_stimulus:.1f}ms "
+                  f"({steps_stimulus} steps)")
+            print(f"  Phase 3 (post-stimulus): {t_final:.1f}ms "
+                  f"({steps_final} steps)")
 
         # Inicialización de variables de estado
         u_old = np.copy(u_0)  # u(t): potenciales membrana en tiempo t
@@ -2006,7 +2112,49 @@ class Echeveste2020(SKNMSIMethodABC):
         simulation_successful = True
         actual_steps = simulation_steps
 
+        # Determinar fase y estímulo actual basado en timestep
         for step in range(simulation_steps):
+            # Determinar estímulo actual según fase
+            # Reference: transients.py lines 131-145
+            current_time_sec = step * dt  # Tiempo actual en segundos
+
+            if use_three_phases:
+                # FASE 1: Actividad espontánea inicial
+                if step < steps_init:
+                    h_current = h_baseline
+                # FASE 2: Presentación del estímulo
+                elif step < (steps_init + steps_stimulus):
+                    # Aplicar transición con delays si están habilitados
+                    if use_delays:
+                        # Tiempo relativo al inicio de la fase 2
+                        phase2_time = current_time_sec - (steps_init * dt)
+                        h_current = h_baseline.copy()
+                        # Activar estímulo para neuronas que ya "recibieron" h
+                        arrived = delays <= phase2_time
+                        h_current[arrived] = h_stimulus[arrived]
+                    else:
+                        # Sin delays: transición instantánea
+                        h_current = h_stimulus
+                # FASE 3: Retorno a actividad espontánea
+                else:
+                    # Aplicar transición inversa con delays si están
+                    # habilitados
+                    if use_delays:
+                        # Tiempo relativo al inicio de la fase 3
+                        phase3_time = current_time_sec - (
+                            (steps_init + steps_stimulus) * dt
+                        )
+                        h_current = h_stimulus.copy()
+                        # Desactivar estímulo para neuronas que ya "regresaron"
+                        arrived = delays <= phase3_time
+                        h_current[arrived] = h_baseline[arrived]
+                    else:
+                        # Sin delays: transición instantánea
+                        h_current = h_baseline
+            else:
+                # Modo single-phase: estímulo constante
+                h_current = h_stimulus
+
             # Calcula actividad neuronal usando
             # función supralineal (Main paper, Eq. 9)
             # r_α = k * [u_α]_+^n donde k=0.3, n=2.0, [x]_+ = max(0,x)
@@ -2016,37 +2164,44 @@ class Echeveste2020(SKNMSIMethodABC):
             r_i = self._integrator.f.supralinear_activation(
                 u_old[self._N_E:]
             )  # Inhibitorias
-            _ = np.concatenate([r_e, r_i])  # noqa: F841
+            _ = bp.math.concatenate([r_e, r_i])  # noqa: F841
 
             # Genera ruido blanco Gaussiano independiente para cada neurona
             # Siguiendo methods.py:413 del código original de Echeveste
-            temp = L @ self._random.normal(loc=0.0, scale=1.0, size=self._N)
+            # IMPORTANTE: Solo si noise_level > 0
+            if noise_level > 0:
+                temp = bp.math.matmul(
+                    L, self._random.normal(loc=0.0, scale=1.0, size=self._N)
+                )
 
-            # Actualiza ruido correlacionado (proceso Ornstein-Uhlenbeck)
-            # Siguiendo methods.py:417 del código original
-            # η(t+dt) = eps_1 * η(t) + eps_2 * temp
-            eta_new = eps_1 * eta_old + eps_2 * temp
+                # Actualiza ruido correlacionado (proceso Ornstein-Uhlenbeck)
+                # Siguiendo methods.py:417 del código original
+                # η(t+dt) = eps_1 * η(t) + eps_2 * temp
+                eta_new = eps_1 * eta_old + eps_2 * temp
+            else:
+                # Sin ruido: η permanece en cero
+                eta_new = eta_old  # (que ya es cero)
 
-            # Actualiza potenciales usando integrador
-            # BrainPy (Main paper, Eq. 8)
-            # MEJORA: Usamos integrador BrainPy en vez de implementación manual
+            # Actualiza potenciales usando integrador BrainPy
+            # (Main paper, Eq. 8)
             # du_α/dt = (-u_α + Σ_β W_αβ r_β + h_α + η_α) / τ_α
+            # IMPORTANTE: Aquí se usa h_current que varía según la fase
             u_e_old, u_i_old = u_old[:self._N_E], u_old[self._N_E:]
             u_e_new, u_i_new = self._integrator(
-                u_e_old, u_i_old, step * dt, W, stimulus, eta_old
+                u_e_old, u_i_old, step * dt, W, h_current, eta_old
             )
-            u_new = np.concatenate([u_e_new, u_i_new])
+            u_new = bp.math.concatenate([u_e_new, u_i_new])
 
             # Guarda estado actual
             u_trajectory[step] = u_new
 
             # Actualiza variables para siguiente paso temporal
-            u_old = np.copy(u_new)
-            eta_old = np.copy(eta_new)
+            u_old = bp.math.array(u_new)  # Use bp.math for GPU support
+            eta_old = bp.math.array(eta_new)  # Use bp.math for GPU support
 
             # Verificación de estabilidad numérica
             # (código original: SSN/methods.py:428, 441, 465, 488, 519, 542)
-            if np.linalg.norm(u_new) > 1000:
+            if bp.math.linalg.norm(u_new) > 1000:
                 simulation_successful = False
                 actual_steps = step  # Explosion occurred at this step
                 print(
@@ -2106,6 +2261,12 @@ class Echeveste2020(SKNMSIMethodABC):
             "requested_simulation_steps": simulation_steps,
             "actual_simulation_time": actual_steps * self._time_res,
             "requested_simulation_time": simulation_time,
+            # Stimulus presentation information
+            "use_three_phases": use_three_phases,
+            "t_init": t_init if use_three_phases else None,
+            "t_stimulus": t_stimulus if use_three_phases else None,
+            "t_final": t_final if use_three_phases else None,
+            "use_delays": use_delays if use_three_phases else None,
         }
 
         return (
@@ -2335,85 +2496,131 @@ class Echeveste2020(SKNMSIMethodABC):
         stimulus = np.full(self._N_E + self._N_I, contrast)
         return stimulus
 
-    def _generate_gsm_stimulus(self, contrast, orientation=0.0):
+    def _generate_gsm_stimulus(self, contrast, orientation=0.0,
+                               use_precomputed=True):
         """
         Generate stimulus from Gaussian Scale Mixture (GSM) generative model.
 
-        Mathematical foundation:
-        - Main paper, Eq. 1-3: GSM generative model I = z * G where:
-          * I: observed image patch
-          * z: scale variable (controls contrast)
-          * G: Gaussian random field (oriented structure)
-        - Main paper, Eq. 4-5: Prior distributions P(z) and P(G)
-        - Main paper, Eq. 6-7: Linear projection to neural inputs h = A^T * I
-        - Main paper, Figure 1A: Gabor-like receptive fields from
-            GSM optimization
-        - Echeveste et al. (2020) Supplementary Material: Detailed GSM
-          mathematics
+        IMPORTANT: This method loads precomputed h_true files that ALREADY
+        have the nonlinear transformation applied. No additional
+        transformation is needed.
 
-        Implementation uses integrated GSM model from generative module.
+        Mathematical foundation:
+        - Main paper, Eq. 1-3: GSM generative model I = z * G
+        - Main paper, Eq. 6-7: Linear projection h_vec = (A^T / 15) @ I
+        - Trained transformation: h = α_h * max(h_vec + β_h, 0)^γ_h
+        - Echeveste et al. (2020) Supplementary Material Table S1
+
+        Parameters
+        ----------
+        contrast : float
+            Contrast level (ignored if use_precomputed=True)
+        orientation : float, optional
+            Orientation in degrees (ignored if use_precomputed=True)
+        use_precomputed : bool, optional
+            If True (default), loads precomputed h_true from files.
+            This is the recommended mode to replicate paper results.
+            If False, raises NotImplementedError (future feature).
+
+        Returns
+        -------
+        h_full : np.ndarray, shape (N_E + N_I,)
+            Transformed SSN input for full network.
+
+        Notes
+        -----
+        The precomputed h_true files (h_true_0, h_true_1, h_true_2)
+        were generated by div_norm_data_GSM.py WITH the transformation
+        already applied. The files contain:
+
+        1. Raw filter response: h_vec = (A.T / 15.0) @ x
+        2. Nonlinear transformation: h = α_h * (h_vec + β_h)^γ_h
+        3. Duplication for E+I: h_full = [h; h]
+
+        This matches the original Echeveste code (full_net.py line 45):
+            h[alpha] = np.loadtxt("h_true_"+str(alpha)+"_learn")
+
+        Contrast mapping (based on available h_true files):
+        - contrast < 0.06  → h_true_0 (spontaneous, z=0.0)
+        - 0.06 ≤ contrast < 0.19 → h_true_1 (low, z≈0.125)
+        - 0.19 ≤ contrast < 0.38 → h_true_2 (medium, z≈0.25)
+        - 0.38 ≤ contrast < 0.75 → h_true_3 (high, z≈0.5)
+        - contrast ≥ 0.75 → h_true_4 (very high, z≈1.0)
+
+        References
+        ----------
+        .. [1] div_norm_data_GSM.py lines 236-241, 352-353:
+               get_true_h_from_x_proj() generates h_true WITH transformation
+        .. [2] full_net.py line 45:
+               Original code loads h_true directly WITHOUT transformation
+        .. [3] parameters.md lines 32-34:
+               Transformation parameters (α_h=1.96, β_h=0.10, γ_h=2.03)
         """
         try:
             # Initialize GSM if not already created
             if not hasattr(self, "_gsm"):
                 self._gsm = self._create_gsm()
 
-            # Generate oriented stimulus using GSM
-            # Maps contrast (0-1) to Echeveste's contrast levels (0-4)
-            contrast_level = contrast * 4.0
+            if use_precomputed:
+                # Map contrast level to file index
+                # Echeveste's contrast levels: [0.0, 0.125, 0.25, 0.5, 1.0]
+                # We have files: h_true_0, h_true_1, h_true_2, h_true_3, h_true_4
+                if contrast < 0.06:
+                    contrast_idx = 0  # Spontaneous activity (z=0.0)
+                elif contrast < 0.19:
+                    contrast_idx = 1  # Low contrast (z≈0.125)
+                elif contrast < 0.38:
+                    contrast_idx = 2  # Medium contrast (z≈0.25)
+                elif contrast < 0.75:
+                    contrast_idx = 3  # High contrast (z≈0.5)
+                else:
+                    contrast_idx = 4  # Very high contrast (z≈1.0)
 
-            # Create oriented stimulus centered at specified orientation
-            # Convert orientation from degrees to neuron index
-            orientation_rad = np.radians(orientation)
-            neuron_orientations = np.linspace(0, np.pi, self._N_E)
-
-            # Find the neuron closest to desired orientation
-            orientation_diffs = np.abs(neuron_orientations - orientation_rad)
-            center_neuron = np.argmin(orientation_diffs)
-
-            # Create Gaussian bump centered at desired orientation
-            sigma = 0.15 * self._N_E  # Width parameter (like original GSM)
-            h_stimulus = np.zeros(self._N_E)
-
-            for i in range(self._N_E):
-                # Circular distance for ring topology
-                dist1 = abs(i - center_neuron)
-                dist2 = self._N_E - abs(i - center_neuron)
-                diff = min(dist1, dist2)
-                h_stimulus[i] = (
-                    contrast_level * np.exp(-0.5 * (diff / sigma) ** 2)
+                # Load precomputed h_true directly from files
+                # IMPORTANT: h_true files already have transformation applied
+                # No additional transformation is needed
+                # Ref: full_net.py line 45 loads h_true directly
+                h_full = self._gsm.load_precomputed_h_transformed(
+                    contrast_idx
                 )
 
-            # Ensure minimum baseline activity
-            h_stimulus += 0.01 * contrast_level
-
-            # Extend to full network size (E + I neurons)
-            expected_size = self._N_E + self._N_I
-            if len(h_stimulus) == self._N_E:
-                # Replicate for I neurons
-                h_full = np.concatenate([h_stimulus, h_stimulus])
-
+                # Validate dimensions
+                expected_size = self._N_E + self._N_I
                 if len(h_full) != expected_size:
                     raise ValueError(
-                        f"Stimulus dimension mismatch after replication. "
+                        f"Stimulus dimension mismatch. "
                         f"Expected {expected_size}, got {len(h_full)}. "
                         f"Network: {self._N_E}E + {self._N_I}I = "
-                        f"{expected_size} total."
+                        f"{expected_size} total. "
+                        f"h_true loaded for contrast_idx={contrast_idx}"
                     )
+
                 return h_full
+
             else:
-                # h_stimulus already has correct size
-                return h_stimulus
+                # Future feature: Generate new stimulus with GSM
+                # This would involve:
+                # 1. Generate image x with GSM: x = z * (A @ y)
+                # 2. Project with filters: h_vec = W_ff @ x
+                # 3. Apply transformation: h = α_h * max(h_vec + β_h, 0)^γ_h
+                # 4. Duplicate for I neurons
+                raise NotImplementedError(
+                    "Dynamic GSM stimulus generation not yet implemented. "
+                    "Use use_precomputed=True to load from files. "
+                    f"Requested contrast={contrast}, orientation={orientation}"
+                )
 
         except Exception as e:
             if "dimension mismatch" in str(e).lower():
                 raise  # Re-raise our custom dimension errors
+            elif isinstance(e, NotImplementedError):
+                raise  # Re-raise NotImplementedError
             else:
                 raise RuntimeError(
                     f"Failed to generate GSM stimulus: {e}. "
                     f"Network size: {self._N_E}E + {self._N_I}I = "
                     f"{self._N_E + self._N_I} total. "
-                    f"Check that the GSM module is properly configured."
+                    f"Check that GSM data files exist and are accessible."
                 ) from e
 
     def _create_gsm(self):
@@ -2709,11 +2916,14 @@ class Echeveste2020(SKNMSIMethodABC):
         # Method 1: Direct mapping using transpose
         # We construct a 256D observation that would
         # produce this activity pattern
-        x_reconstructed = np.dot(A, excitatory_activity)  # (256,)
+        # Note: Using JAX for GPU acceleration
+        import jax.numpy as jnp
+
+        x_reconstructed = jnp.dot(A, excitatory_activity)  # (256,)
 
         # Add realistic noise level based on GSM parameters
-        if np.std(x_reconstructed) > 0:
-            noise_scale = 0.1 * np.std(x_reconstructed)
+        if jnp.std(x_reconstructed) > 0:
+            noise_scale = 0.1 * jnp.std(x_reconstructed)
         else:
             noise_scale = 0.1
         noise = np.random.normal(0, noise_scale, len(x_reconstructed))
@@ -2724,11 +2934,11 @@ class Echeveste2020(SKNMSIMethodABC):
 
         n_contrasts = len(contrast_range)
         D_x = len(x_observation)
-        log_p = np.zeros(n_contrasts)
+        log_p = jnp.zeros(n_contrasts)
 
-        # Pre-compute matrices for efficiency
-        ACA_T = np.dot(A, np.dot(C, A.T))  # A*C*A^T
-        mean_x = np.zeros(D_x)  # Mean is always zero in GSM
+        # Pre-compute matrices for efficiency (GPU accelerated)
+        ACA_T = jnp.dot(A, jnp.dot(C, A.T))  # A*C*A^T
+        mean_x = jnp.zeros(D_x)  # Mean is always zero in GSM
 
         # GSM noise variance (from original code parameters)
         s_x_2 = 100.0  # This matches original Echeveste parameters
@@ -2745,7 +2955,7 @@ class Echeveste2020(SKNMSIMethodABC):
 
         for i, z in enumerate(contrast_range):
             # Likelihood: P(x|z) ~ N(0, z^2 * A*C*A^T + s_x^2 * I)
-            covariance = z * z * ACA_T + s_x_2 * np.eye(D_x)
+            covariance = z * z * ACA_T + s_x_2 * jnp.eye(D_x)
 
             try:
                 # Log prior: P(z) ~ Gamma(k, theta)
@@ -2754,7 +2964,7 @@ class Echeveste2020(SKNMSIMethodABC):
 
                     log_prior = gamma.logpdf(z, k_gamma, scale=theta_gamma)
                 else:
-                    log_prior = -np.inf  # Zero prior for negative contrasts
+                    log_prior = -jnp.inf  # Zero prior for negative contrasts
 
                 # Log likelihood: P(x|z) ~ N(0, Cov)
                 from scipy.stats import multivariate_normal
@@ -2764,25 +2974,25 @@ class Echeveste2020(SKNMSIMethodABC):
                 )
 
                 # Log posterior = log prior + log likelihood
-                log_p[i] = log_prior + log_likelihood
+                log_p = log_p.at[i].set(log_prior + log_likelihood)
 
             except (np.linalg.LinAlgError, ValueError):
                 # Handle numerical issues with singular covariance
-                log_p[i] = -np.inf
+                log_p = log_p.at[i].set(-jnp.inf)
 
         # Normalize probabilities (exactly as in original code)
-        max_log_p = np.max(log_p)
-        p_unnorm = np.exp(log_p - max_log_p)
-        norm = np.sum(p_unnorm) * dz
+        max_log_p = jnp.max(log_p)
+        p_unnorm = jnp.exp(log_p - max_log_p)
+        norm = jnp.sum(p_unnorm) * dz
 
         if norm > 0:
             probabilities = p_unnorm / norm
         else:
             # Fallback: uniform distribution
-            probabilities = np.ones(n_contrasts) / n_contrasts
+            probabilities = jnp.ones(n_contrasts) / n_contrasts
 
         # Find MAP estimate
-        map_idx = np.argmax(probabilities)
+        map_idx = jnp.argmax(probabilities)
         map_estimate = contrast_range[map_idx]
 
         return {

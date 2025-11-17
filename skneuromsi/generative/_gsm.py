@@ -186,10 +186,10 @@ class GSM:
         spatial_freq=DEFAULT_SPATIAL_FREQ,
         bandwidth=DEFAULT_BANDWIDTH,
         alpha_h=1.96,
-        beta_h=1.9,  # Baseline from Echeveste et al. (2020) Table S1
+        beta_h=0.10,
         gamma_h=2.03,
         correlation_strength=0.5,
-        noise_variance=0.01,
+        noise_variance=100.0,
         random_seed=None,
         use_pretrained=True,
     ):
@@ -214,11 +214,12 @@ class GSM:
         self.use_pretrained = use_pretrained
 
         # Nonlinearity parameters for SSN input h
-        # Ref: Echeveste et al. 2020, ssn_inference_optimizer/objective.ml
-        # Formula: h = α_h · (β_h + filter_response)^γ_h
-        self.alpha_h = alpha_h  # α_h: Input scaling (multiplicador)
-        self.beta_h = beta_h    # β_h: Input baseline (offset)
-        self.gamma_h = gamma_h  # γ_h: Input power (exponente)
+        # Ref: Echeveste et al. 2020 parameters.md lines 32-34 (OPTIMIZED)
+        # Formula: h = α_h · (filter_response + β_h)^γ_h
+        # NOTE: These are DIFFERENT from generative model params (lines 13-15)
+        self.alpha_h = alpha_h  # α_h: Input scaling = 1.96 (optimized)
+        self.beta_h = beta_h    # β_h: Input baseline = 0.10 (optimized)
+        self.gamma_h = gamma_h  # γ_h: Input power = 2.03 (optimized)
 
         # Initialize random state
         if random_seed is not None:
@@ -298,13 +299,20 @@ class GSM:
             np.random.seed(random_seed)
         self._random_state = np.random.RandomState(random_seed)
 
-    def generate_stimulus_patch(self, contrast):
+    def generate_stimulus_patch(self, contrast, add_noise=True):
         """Generate a single stimulus patch with given contrast.
 
         Parameters
         ----------
         contrast : float
             Contrast level for the generated patch.
+        add_noise : bool, optional
+            Whether to add observation noise to the patch. Default: True.
+            Set to False to replicate Echeveste's target generation workflow
+            (GSM.py lines 363-364), where targets are generated without
+            observation noise. This is important because for low contrasts
+            (z < 0.5), the noise σ_η=10 dominates the signal and prevents
+            monotonic growth of h with contrast.
 
         Returns
         -------
@@ -313,6 +321,12 @@ class GSM:
             - 'x': Generated image patch (flattened)
             - 'y': Latent orientation representation
             - 'z': True contrast value
+
+        Notes
+        -----
+        Echeveste et al. (2020) generates training targets WITHOUT noise
+        to avoid the signal-to-noise ratio problems at low contrasts.
+        For z=0.125, SNR ≈ 0.5 (noise is 2x the signal).
         """
         # Sample from prior distribution over orientations eq.2
         y = self._random_state.multivariate_normal(
@@ -321,10 +335,16 @@ class GSM:
 
         # Generate image patch: x = z * A @ y + noise eq.1
         clean_patch = contrast * (self.A @ y)
-        noise = self._random_state.normal(
-            0, np.sqrt(self.noise_variance), self.patch_dim
-        )
-        x = clean_patch + noise
+
+        if add_noise:
+            # Add observation noise (for realistic simulations)
+            noise = self._random_state.normal(
+                0, np.sqrt(self.noise_variance), self.patch_dim
+            )
+            x = clean_patch + noise
+        else:
+            # No noise (como Echeveste para targets, GSM.py líneas 363-364)
+            x = clean_patch
 
         return {"x": x, "y": y, "z": contrast}
 
@@ -402,6 +422,126 @@ class GSM:
         filter_response = self.A.T @ x
         h = self.h_scale * filter_response
         return h
+
+    def generate_h_input_raw(self, x):
+        """
+        Generate RAW filter response WITHOUT nonlinear transformation.
+
+        This method returns the filter responses before applying the
+        nonlinear transformation parameters (alpha_h, beta_h, gamma_h).
+        It matches the h_vec used in Echeveste's optimization, where
+        the transformation parameters are learned during training.
+
+        Parameters
+        ----------
+        x : numpy.ndarray
+            Image patch (flattened), shape (patch_dim,)
+
+        Returns
+        -------
+        h_vec_raw : numpy.ndarray
+            Raw filter responses = W_ff @ x, shape (n_orientations,)
+            WITHOUT h_scale factor and WITHOUT nonlinear transformation
+
+        Notes
+        -----
+        In Echeveste's code (objective.ml:410-413), h_vec is the RAW
+        filter response that gets saved to files (h0, h1, etc.), and
+        the transformation is applied during optimization:
+
+            h_transformed[i] = α_h * (h_vec[i] + β_h)^γ_h
+
+        where α_h, β_h, γ_h are parameters that get optimized.
+
+        This is different from generate_h_input_efficient() which
+        applies the transformation with fixed parameter values.
+
+        References
+        ----------
+        .. [1] ssn_inference_optimizer/objective.ml lines 410-413
+        .. [2] ssn_inference_optimizer/train.ml lines 134-136
+               (saves h to files without transformation)
+        """
+        # Calcular respuesta de filtros SIN transformación no lineal
+        # Esto corresponde a h_vec en el código OCaml (antes de aplicar
+        # la transformación con α_h, β_h, γ_h)
+        # Ref: W_ff = A.T / 15.0 según Tabla S1
+        filter_response = self.W_ff @ x
+        return filter_response
+
+    def load_precomputed_h_transformed(self, contrast_idx):
+        """Load precomputed h_true from files.
+
+        IMPORTANT: The h_true files already have the nonlinear
+        transformation applied and include both E and I neurons.
+
+        This method loads h_true files directly from the original
+        Echeveste code (h_true_0_learn, h_true_1_learn, h_true_2_learn).
+        These files were generated WITH the transformation already applied.
+
+        Parameters
+        ----------
+        contrast_idx : int
+            Index of contrast level:
+            - 0: spontaneous activity (contrast=0.0)
+            - 1: low contrast (contrast≈0.125)
+            - 2: medium contrast (contrast≈0.25)
+
+        Returns
+        -------
+        h_true : np.ndarray, shape (2*n_orientations,)
+            Precomputed SSN input for full network (E+I neurons).
+            The transformation and duplication have already been applied
+            during data generation.
+
+        Notes
+        -----
+        The h_true files were generated by div_norm_data_GSM.py with:
+
+        1. Generate GSM stimulus: x = z * (A @ y)
+        2. Project with filters: x_proj = A.T @ x
+        3. Scale: h_vec = (1/15) * x_proj
+        4. Transform: h_true = α_h * (β_h + h_vec)^γ_h
+        5. Duplicate: h_full = [h_true; h_true]
+
+        The original code loads these files directly WITHOUT applying
+        any additional transformation (full_net.py line 45):
+            h[alpha] = np.loadtxt("h_true_"+str(alpha)+"_learn")
+
+        References
+        ----------
+        .. [1] div_norm_data_GSM.py lines 236-241:
+               get_true_h_from_x_proj() applies transformation
+        .. [2] div_norm_data_GSM.py lines 352-353:
+               h_true generated WITH transformation
+        .. [3] full_net.py line 45:
+               Original code loads h_true directly
+        .. [4] parameters.md lines 32-34:
+               Transformation parameters (α_h=1.96, β_h=0.10, γ_h=2.03)
+
+        Examples
+        --------
+        >>> gsm = GSM()
+        >>> h_spontaneous = gsm.load_precomputed_h_transformed(0)
+        >>> h_low_contrast = gsm.load_precomputed_h_transformed(1)
+        >>> h_medium_contrast = gsm.load_precomputed_h_transformed(2)
+        """
+        # Load h_true directly from files (already transformed + duplicated)
+        loader = GSMDataLoader()
+        h_true = loader.load_h_vec_transformed(contrast_idx)
+
+        # Validate dimensions (should be 2*n_orientations = 100)
+        expected_size = 2 * self.n_orientations
+        if len(h_true) != expected_size:
+            raise ValueError(
+                f"h_true dimension mismatch. "
+                f"Expected {expected_size} (2*{self.n_orientations}), "
+                f"got {len(h_true)}. "
+                f"Check that GSM is initialized with correct "
+                f"n_orientations."
+            )
+
+        return h_true
 
     def generate_stimuli(self, contrasts, n_samples):
         """Generate stimulus patches and SSN inputs.
@@ -548,7 +688,7 @@ class GSM:
         return mu_post, Sigma_post
 
     def compute_posterior_for_ssn_training(
-        self, contrast, n_samples=100, z_map=None
+        self, contrast, n_samples=100, z_map=None, apply_transformation=True
     ):
         """
         Compute target posterior statistics for SSN training.
@@ -565,6 +705,12 @@ class GSM:
             Number of samples to average over (default: 100)
         z_map : float, optional
             MAP contrast estimate (if None, uses contrast value)
+        apply_transformation : bool, optional
+            If True (default), apply nonlinear transformation (α_h, β_h, γ_h)
+            to h_vec using generate_h_input_efficient().
+            If False, return raw filter responses using
+            generate_h_input_raw() for optimization of transformation
+            parameters during training.
 
         Returns
         -------
@@ -574,6 +720,8 @@ class GSM:
             - 'target_sigma': Average posterior covariance,
               shape (n_orientations, n_orientations)
             - 'h_inputs': SSN input vectors h, shape (n_samples, n_orient)
+              If apply_transformation=True: transformed h = α_h*(h_vec+β_h)^γ_h
+              If apply_transformation=False: raw h_vec = W_ff @ x
             - 'stimuli': Generated image patches, shape (n_samples, patch_dim)
 
         Notes
@@ -583,6 +731,11 @@ class GSM:
         2. Calcula el posterior GSM para cada uno
         3. Promedia los momentos para obtener estadísticas target
         4. Retorna también los inputs h correspondientes
+
+        Cuando apply_transformation=False, los h_inputs son las respuestas
+        RAW de los filtros (h_vec en código Echeveste), permitiendo que
+        los parámetros de transformación α_h, β_h, γ_h se optimicen
+        durante el entrenamiento (ver objective.ml:410-413).
         """
         if z_map is None:
             z_map = contrast
@@ -605,19 +758,44 @@ class GSM:
             all_mu.append(mu_post)
             all_Sigma.append(Sigma_post)
 
-            # Generar input h para SSN con transformación no lineal entrenada
-            h = self.generate_h_input_efficient(x)
-            all_h.append(h)
+            # Generar input h para SSN
+            # Si apply_transformation=True: aplica α_h, β_h, γ_h
+            # Si apply_transformation=False: devuelve h_vec raw para
+            # optimizar α_h, β_h, γ_h
+            if apply_transformation:
+                h_exc = self.generate_h_input_efficient(x)
+            else:
+                h_exc = self.generate_h_input_raw(x)
 
-        # Promediar momentos
-        target_mu = np.mean(all_mu, axis=0)
-        target_Sigma = np.mean(all_Sigma, axis=0)
+            # Extender h_exc (size N_E) a h_full (size N_E+N_I)
+            # Las neuronas inhibitorias reciben el mismo input que las
+            # excitatorias en el mismo ángulo
+            # Ref: train.ml line 22: h_vec has size 2*m
+            h_full = np.concatenate([h_exc, h_exc])
+            all_h.append(h_full)
+
+        # Retornar targets individuales (como Echeveste original)
+        # NO promediar - cada muestra es un target independiente
+        # Ref: ssn_inference_optimizer/objective.ml lines 569-573
+        all_mu = np.array(all_mu)
+        all_Sigma = np.array(all_Sigma)
+        all_h = np.array(all_h)
+        all_x = np.array(all_x)
+
+        # También calcular promedios para compatibilidad
+        target_mu_avg = np.mean(all_mu, axis=0)
+        target_Sigma_avg = np.mean(all_Sigma, axis=0)
 
         return {
-            'target_mu': target_mu,
-            'target_sigma': target_Sigma,
-            'h_inputs': np.array(all_h),
-            'stimuli': np.array(all_x),
+            # Targets individuales (para Stage 1 con samples)
+            'targets_mu': all_mu,           # shape: (n_samples, N_E)
+            'targets_sigma': all_Sigma,     # shape: (n_samples, N_E, N_E)
+            # shape: (n_samples, N_E+N_I) where N=N_E+N_I
+            'h_inputs': all_h,
+            'stimuli': all_x,               # shape: (n_samples, patch_dim)
+            # Promedios (para Stage 2 con ADF)
+            'target_mu': target_mu_avg,     # shape: (N_E,)
+            'target_sigma': target_Sigma_avg,  # shape: (N_E, N_E)
         }
 
     def compute_input_baseline_lb(

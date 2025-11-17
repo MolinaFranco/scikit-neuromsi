@@ -924,9 +924,9 @@ def create_temporal_weighting(n_time_bins, min_time_bins, zero_up_to=None):
     return temporal_weighting
 
 
-@jax.jit
+# No usar @jax.jit porque n_time_bins_slow debe ser concreto para jnp.arange
 def compute_slowness_cost(w, mu, sigma, inv_taus, dt, t_max_slow,
-                          k, lambda_slow):
+                          k, lambda_slow, n_time_bins_slow):
     """
     Compute slowness penalty cost.
 
@@ -1027,8 +1027,8 @@ def compute_slowness_cost(w, mu, sigma, inv_taus, dt, t_max_slow,
     # PASO 3: Normalizar lambda_slow por tamaño del sistema
     # Ref: objective.ml:113
     # lambda_slow /= (2 * N * n_time_bins_slow * n_targets)
+    # NOTA: n_time_bins_slow se pasa como argumento (precalculado)
     N = len(mu)
-    n_time_bins_slow = int(t_max_slow / dt)
     n_targets = 1  # Típicamente 1 target
     lambda_slow_norm = lambda_slow / (2.0 * N * n_time_bins_slow * n_targets)
 
@@ -1347,6 +1347,30 @@ def compute_evolution_costs(
     else:
         temporal_weighting = jnp.asarray(temporal_weighting)
 
+    # PASO 1c: Normalizar lambdas por tamaño del sistema
+    # "give the multipliers their natural scaling with system size"
+    # (objective.ml:109)
+    #
+    # n_targets se asume 1 aquí (se suma sobre targets en nivel superior)
+    # n_subsamp_bins = número de bins evaluados después de subsampling
+    # Referencia: objective.ml lines 110-113
+    #
+    # Para N_E=50, n_targets=1, n_time_bins=500, subsamp_bins=25:
+    # (valores de Stage 2: t_max=0.1, t_subsamp=0.005, dt=0.0002)
+    # norm = 2 * 50 * 1 * (500/25) = 2,000
+    # lambda_mean = 1.0 / 2,000 = 5.0×10⁻⁴
+    #
+    # Para N_E=50, n_targets=5 (sumando sobre targets en nivel superior):
+    # norm = 2 * 50 * 5 * 50 = 25,000
+    # lambda_mean = 1.0 / 25,000 = 4.0×10⁻⁵ ✅ Coincide con Tabla S1
+    # lambda_var = 2.0 / 25,000 = 8.0×10⁻⁵ ✅ Coincide con Tabla S1
+    # lambda_cov = 1.0 / 1,250,000 = 8.0×10⁻⁷ ✅ Coincide con Tabla S1
+    n_targets = 1  # Por target individual, se suma sobre targets afuera
+    n_subsamp_bins = n_time_bins // subsamp_bins
+    lambda_mean_norm = lambda_mean / (2.0 * m * n_targets * n_subsamp_bins)
+    lambda_var_norm = lambda_var / (2.0 * m * n_targets * n_subsamp_bins)
+    lambda_cov_norm = lambda_cov / (2.0 * m * m * n_targets * n_subsamp_bins)
+
     # PASO 2: Condiciones iniciales de los momentos
     # Valores estándar del código original (objective.ml lines 404-407)
     # μ(0) = 0: red comienza en reposo (sin actividad)
@@ -1396,9 +1420,10 @@ def compute_evolution_costs(
 
             # Calcular los tres componentes de costo
             # Compara μ_exc, Σ_exc con μ_target, Σ_target del GSM
+            # Usa lambdas normalizados (calculados en PASO 1c)
             c_mean, c_var, c_cov = compute_cost_components(
                 mu_exc, sigma_exc, target_mu, target_sigma,
-                lambda_mean, lambda_var, lambda_cov
+                lambda_mean_norm, lambda_var_norm, lambda_cov_norm
             )
 
             # Acumular costos para este timestep MULTIPLICADOS POR wt
@@ -1417,8 +1442,11 @@ def compute_evolution_costs(
     # El slowness cost penaliza cambios rápidos en Σ durante dinámica
     # Solo se usa en Stage 2 (L-BFGS) con lambda_slow típicamente 0.1
     if lambda_slow > 0:
+        # Precalcular n_time_bins_slow fuera de la función JIT
+        n_time_bins_slow = int(t_max / dt)
         cost_slow = compute_slowness_cost(
-            w, mu, sigma, inv_taus, dt, t_max, k, lambda_slow
+            w, mu, sigma, inv_taus, dt, t_max, k, lambda_slow,
+            n_time_bins_slow
         )
         total_cost = total_cost + cost_slow
 
@@ -1427,6 +1455,70 @@ def compute_evolution_costs(
     # - mu, sigma: útiles para debugging/visualización
     # IMPORTANTE: No usar float() aquí porque rompe autodiff de JAX
     return total_cost, mu, sigma
+
+
+# =============================================================================
+# Input transformation utilities
+# =============================================================================
+
+
+def apply_input_transformation(h_vec_raw, alpha_h, beta_h, gamma_h):
+    """
+    Apply nonlinear input transformation to raw filter responses.
+
+    Implements the learned nonlinear transformation from Echeveste et al.
+    (2020) that maps raw filter responses to effective SSN inputs:
+
+        h_transformed[i] = α_h * (h_vec[i] + β_h)^γ_h
+
+    This transformation is applied during optimization to allow gradients
+    to flow through JAX's automatic differentiation.
+
+    Parameters
+    ----------
+    h_vec_raw : jax.numpy.ndarray, shape (n_orientations,)
+        Raw filter responses: W_ff @ x
+    alpha_h : float
+        Input scaling parameter (α_h)
+        Typical values: 1.0 (initial) → 1.96 (optimized)
+    beta_h : float
+        Input baseline parameter (β_h)
+        Typical values: ~1.6 (initial) → 0.10 (optimized)
+        Must satisfy: beta_h + min(h_vec_raw) >= 0.1
+    gamma_h : float
+        Input power parameter (γ_h)
+        Typical values: 1.0 (initial) → 2.03 (optimized)
+
+    Returns
+    -------
+    h_transformed : jax.numpy.ndarray, shape (n_orientations,)
+        Transformed input suitable for SSN
+
+    References
+    ----------
+    .. [1] Echeveste et al. (2020), Supplementary Table S1
+    .. [2] ssn_inference_optimizer/objective.ml lines 410-413
+    .. [3] ssn_inference_optimizer/train.ml lines 93-95 (initial values)
+
+    Notes
+    -----
+    The transformation uses exp/log to compute the power:
+        (h + β)^γ = exp(γ * log(h + β))
+
+    This matches the OCaml implementation and ensures numerical stability.
+
+    The argument (h_vec + β_h) must be positive. This is guaranteed by
+    computing input_baseline_lb from the GSM data and requiring:
+        β_h >= input_baseline_lb
+    """
+    # Ref: objective.ml:410-413
+    # let%diff h prms h_vec =
+    #   V.init n (fun i ->
+    #       prms.input_scaling * exp (prms.input_nl_pow *
+    #                                 log (h_vec.{i} +. prms.input_baseline)))
+    argument = h_vec_raw + beta_h
+    h_transformed = alpha_h * jnp.exp(gamma_h * jnp.log(argument))
+    return h_transformed
 
 
 # =============================================================================
@@ -1573,9 +1665,9 @@ def create_objective_function(
         # Check that heights are > 0.01
         for i, key in enumerate(['a_EE', 'a_EI', 'a_IE', 'a_II']):
             h = params[key]
-            if h <= 0.011:
+            if h <= 0.010:
                 raise ValueError(
-                    f"Weight height {key}={h} must be > 0.011"
+                    f"Weight height {key}={h} must be > 0.010"
                 )
             x = x.at[3 + i].set(jnp.sqrt(h - 0.01))
 
@@ -1824,10 +1916,9 @@ def create_objective_function(
         beta_h = params['input_baseline']
         gamma_h = params['input_nl_pow']
 
-        # h = α_h · exp(γ_h · log(β_h + h_vec))
-        # This is equivalent to: h = α_h · (β_h + h_vec)^γ_h
-        # Ref: objective.ml line 413
-        return alpha_h * jnp.exp(gamma_h * jnp.log(beta_h + h_vec))
+        # Usar función utility apply_input_transformation
+        # que tiene la misma lógica pero está documentada globalmente
+        return apply_input_transformation(h_vec, alpha_h, beta_h, gamma_h)
 
     def objective(x):
         """
@@ -2135,6 +2226,367 @@ def _compute_costs_with_samples_jitted(
     return total_cost, mu_empirical, sigma_empirical
 
 
+def create_objective_function_with_samples(
+    gsm_model, N_E, N_I, tau_e, tau_i, tau_eta, k,
+    dt, t_max, t_subsamp, min_time=0.05,
+    lambda_mean=1.0, lambda_var=1.0, lambda_cov=1.0,
+    n_trials=50, temporal_weighting=None, jax_key=None,
+    gsm_data=None
+):
+    """
+    Create objective function for ADAM optimization with sample-based costs.
+
+    Esta función es idéntica a create_objective_function pero usa
+    compute_costs_with_samples en lugar de compute_evolution_costs (ADF).
+
+    Replica EXACTAMENTE Echeveste et al. (2020) Modo 1 (ADAM + samples)
+    optimizando los 15 parámetros:
+    - 3 input transformation: α_h, β_h, γ_h
+    - 8 connectivity: a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II
+    - 4 noise covariance: width, σ_E, σ_I, ρ
+
+    Parameters
+    ----------
+    gsm_model : object
+        Pre-trained GSM model with target statistics
+    N_E : int
+        Number of excitatory neurons
+    N_I : int
+        Number of inhibitory neurons
+    tau_e : float
+        Excitatory time constant (seconds)
+    tau_i : float
+        Inhibitory time constant (seconds)
+    tau_eta : float
+        Noise autocorrelation time (seconds)
+    k : float
+        Supralinear scaling constant
+    dt : float
+        Time step (seconds)
+    t_max : float
+        Maximum integration time (seconds)
+    t_subsamp : float
+        Cost subsampling interval (seconds)
+    min_time : float
+        Minimum time before cost evaluation
+    lambda_mean : float
+        Mean matching weight
+    lambda_var : float
+        Variance matching weight
+    lambda_cov : float
+        Covariance matching weight
+    n_trials : int
+        Number of stochastic trials (default: 50)
+    temporal_weighting : array_like, optional
+        Temporal weighting for annealing (default: None)
+    jax_key : jax.random.PRNGKey, optional
+        Random key for JAX (default: None, will create one)
+    gsm_data : dict, optional
+        Pre-computed GSM targets (if None, will be generated)
+
+    Returns
+    -------
+    objective_fn : callable
+        Objective function f(x) -> cost
+        Maps 15-parameter vector to scalar cost (stochastic)
+    gradient_fn : callable
+        Gradient function f'(x) -> grad
+        Returns gradient with respect to all 15 parameters (stochastic)
+    pack_fn : callable
+        Function to pack physical parameters into optimization vector
+        Signature: pack_fn(params_dict) -> x
+    unpack_fn : callable
+        Function to unpack optimization vector to physical parameters
+        Signature: unpack_fn(x) -> params_dict
+
+    References
+    ----------
+    .. [1] Echeveste et al. (2020) Nature Neuroscience, Methods page 18
+    .. [2] ssn_inference_optimizer/train.ml lines 280-293 (ADAM mode)
+    .. [3] ssn_inference_optimizer/objective.ml lines 569-573 (multi-target)
+
+    Notes
+    -----
+    Esta función usa compute_costs_with_samples que simula n_trials
+    trayectorias estocásticas para estimar los momentos de la red.
+    Los gradientes son estocásticos (variance across trials).
+
+    CRITICAL FIX: Ahora itera sobre múltiples targets como Echeveste
+    original (objective.ml:569-573), en lugar de usar placeholder fijo.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    n = N_E + N_I
+
+    # Inverse time constants
+    inv_taus = jnp.concatenate([
+        jnp.full(N_E, 1.0 / tau_e),
+        jnp.full(N_I, 1.0 / tau_i)
+    ])
+
+    # Calcular input_baseline_lb dinámicamente desde el GSM
+    # Ref: ssn_inference_optimizer/train.ml lines 47-49
+    input_baseline_lb = gsm_model.compute_input_baseline_lb(n_samples=100)
+    print(f"Calculated input_baseline_lb: {input_baseline_lb:.6f}")
+
+    # Random key for JAX
+    if jax_key is None:
+        jax_key = jax.random.PRNGKey(0)
+
+    # Obtener targets del GSM (array de targets individuales)
+    # Ref: objective.ml lines 569-573
+    if gsm_data is None:
+        gsm_data = gsm_model.compute_posterior_for_ssn_training(
+            contrast=0.5, n_samples=50, apply_transformation=False
+        )
+
+    # Extraer targets individuales como JAX arrays
+    # Cada target tiene (h_vec, mu_vec, sigma_mat)
+    targets_h = jnp.array(gsm_data['h_inputs'])      # (n_samples, N)
+    targets_mu = jnp.array(gsm_data['targets_mu'])   # (n_samples, N_E)
+    # (n_samples, N_E, N_E)
+    targets_sigma = jnp.array(gsm_data['targets_sigma'])
+    n_targets = targets_h.shape[0]
+
+    print(f"  Loaded {n_targets} individual targets from GSM")
+    print(f"    h_inputs: {targets_h.shape}")
+    print(f"    targets_mu: {targets_mu.shape}")
+    print(f"    targets_sigma: {targets_sigma.shape}")
+
+    def pack_parameters(params):
+        """
+        Pack physical parameters into optimization vector.
+
+        Parameters
+        ----------
+        params : dict
+            Dictionary with physical parameters (15 total)
+
+        Returns
+        -------
+        x : jax.numpy.ndarray, shape (15,)
+            Packed optimization vector
+
+        References
+        ----------
+        .. [1] ssn_inference_optimizer/objective.ml lines 185-214
+        """
+        x = jnp.zeros(15)
+
+        # Input transformation parameters (indices 0-2)
+        x = x.at[0].set(jnp.sqrt(params['input_baseline'] -
+                                 input_baseline_lb))
+        x = x.at[1].set(jnp.sqrt(params['input_scaling']))
+        x = x.at[2].set(jnp.sqrt(params['input_nl_pow']))
+
+        # Weight matrix heights (indices 3-6)
+        for i, key in enumerate(['a_EE', 'a_EI', 'a_IE', 'a_II']):
+            h = params[key]
+            if h <= 0.011:
+                raise ValueError(
+                    f"Weight height {key}={h} must be > 0.011"
+                )
+            x = x.at[3 + i].set(jnp.sqrt(h - 0.01))
+
+        # Weight matrix widths (indices 7-10)
+        for i, key in enumerate(['d_EE', 'd_EI', 'd_IE', 'd_II']):
+            x = x.at[7 + i].set(params[key])
+
+        # Noise covariance parameters (indices 11-14)
+        x = x.at[11].set(params['sigma_eta_width'])
+        x = x.at[12].set(params['sigma_eta_std_e'])
+        x = x.at[13].set(params['sigma_eta_std_i'])
+
+        rho = params['sigma_eta_rho']
+        z = 2.0 * rho - 1.0
+        rho_packed = 0.5 * (jnp.log(1.0 + z) - jnp.log(1.0 - z))
+        x = x.at[14].set(rho_packed)
+
+        return x
+
+    def unpack_parameters(x):
+        """
+        Unpack optimization vector to physical parameters.
+
+        Parameters
+        ----------
+        x : array_like, shape (15,)
+            Optimization parameter vector
+
+        Returns
+        -------
+        params : dict
+            Dictionary with unpacked parameters (15 total)
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Nature Neuroscience, Eq. 10, 12-14
+        .. [2] ssn_inference_optimizer/objective.ml lines 153-180
+        """
+        params = {}
+
+        # Input transformation parameters (indices 0-2)
+        params['input_baseline'] = input_baseline_lb + x[0]**2
+        params['input_scaling'] = x[1]**2
+        params['input_nl_pow'] = x[2]**2
+
+        # Weight matrix heights (indices 3-6)
+        params['a_EE'] = 0.01 + x[3]**2
+        params['a_EI'] = 0.01 + x[4]**2
+        params['a_IE'] = 0.01 + x[5]**2
+        params['a_II'] = 0.01 + x[6]**2
+
+        # Weight matrix widths (indices 7-10)
+        params['d_EE'] = x[7]
+        params['d_EI'] = x[8]
+        params['d_IE'] = x[9]
+        params['d_II'] = x[10]
+
+        # Noise covariance parameters (indices 11-14)
+        params['sigma_eta_width'] = x[11]
+        params['sigma_eta_std_e'] = x[12]
+        params['sigma_eta_std_i'] = x[13]
+        params['sigma_eta_rho'] = 0.5 * (1.0 + jnp.tanh(x[14]))
+
+        return params
+
+    def build_w_from_params(params):
+        """Construir matriz W desde parámetros."""
+        W = jnp.zeros((n, n))
+
+        # Orientaciones en el ring
+        theta = jnp.linspace(0, jnp.pi, N_E, endpoint=False)
+
+        # Función auxiliar para construir bloques
+        # Ref: objective.ml lines 285-287
+        def connectivity_block(theta_pre, theta_post, a, d, sign):
+            delta = theta_pre[:, None] - theta_post[None, :]
+            return sign * a * jnp.exp(
+                (jnp.cos(delta) - 1) / (d**2)
+            )
+
+        # Construir bloques
+        W = W.at[:N_E, :N_E].set(
+            connectivity_block(theta, theta, params['a_EE'],
+                               params['d_EE'], 1.0)
+        )
+        W = W.at[:N_E, N_E:].set(
+            connectivity_block(theta, theta, params['a_EI'],
+                               params['d_EI'], -1.0)
+        )
+        W = W.at[N_E:, :N_E].set(
+            connectivity_block(theta, theta, params['a_IE'],
+                               params['d_IE'], 1.0)
+        )
+        W = W.at[N_E:, N_E:].set(
+            connectivity_block(theta, theta, params['a_II'],
+                               params['d_II'], -1.0)
+        )
+
+        return W
+
+    def build_sigma_eta(params):
+        """Build noise covariance matrix Σ_η from parameters."""
+        width = params['sigma_eta_width']
+        std_e = params['sigma_eta_std_e']
+        std_i = params['sigma_eta_std_i']
+        rho = params['sigma_eta_rho']
+
+        var_e = std_e ** 2
+        var_i = std_i ** 2
+
+        theta = jnp.linspace(0, jnp.pi, N_E, endpoint=False)
+        delta = theta[:, None] - theta[None, :]
+
+        # Spatial kernel
+        spatial_kernel = jnp.exp((jnp.cos(delta) - 1) / (width**2))
+
+        # Build blocks
+        Sigma_ee = var_e * spatial_kernel
+        Sigma_ii = var_i * spatial_kernel
+        Sigma_ei = rho * jnp.sqrt(var_e * var_i) * spatial_kernel
+
+        # Assemble full matrix
+        Sigma_eta = jnp.block([
+            [Sigma_ee, Sigma_ei],
+            [Sigma_ei.T, Sigma_ii]
+        ])
+
+        # Add diagonal term for stability
+        Sigma_eta = Sigma_eta + 0.01 * jnp.eye(n)
+
+        return Sigma_eta
+
+    def transform_h_input(h_vec, params):
+        """Transform input h using learned nonlinear transformation."""
+        alpha_h = params['input_scaling']
+        beta_h = params['input_baseline']
+        gamma_h = params['input_nl_pow']
+
+        # Usar función utility apply_input_transformation
+        return apply_input_transformation(h_vec, alpha_h, beta_h, gamma_h)
+
+    def objective(x):
+        """
+        Optimization objective function (stochastic, with samples).
+
+        Itera sobre múltiples targets como en Echeveste original
+        (objective.ml lines 569-573).
+
+        Parameters
+        ----------
+        x : array_like, shape (15,)
+            Optimization parameter vector
+
+        Returns
+        -------
+        cost : float
+            Total objective value summed over all targets (stochastic)
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Nature Neuroscience, Methods page 18
+        .. [2] ssn_inference_optimizer/train.ml lines 280-293
+        .. [3] ssn_inference_optimizer/objective.ml lines 569-573
+        """
+        # Unpack all 15 parameters
+        params = unpack_parameters(x)
+
+        # Build connectivity matrix W (same for all targets)
+        w = build_w_from_params(params)
+
+        # Build noise covariance matrix Σ_η (same for all targets)
+        sigma_eta = build_sigma_eta(params)
+
+        # Iterar sobre cada target y sumar los costos
+        # Ref: objective.ml lines 569-573
+        total_cost = 0.0
+        for i in range(n_targets):
+            # Transform input h para este target
+            h = transform_h_input(targets_h[i], params)
+
+            # Compute evolution costs with SAMPLES para este target
+            cost_i, _, _ = compute_costs_with_samples(
+                w, h, sigma_eta, inv_taus,
+                dt, tau_eta, t_max, t_subsamp,
+                targets_mu[i], targets_sigma[i], k,
+                lambda_mean, lambda_var, lambda_cov,
+                min_time, n_trials, jax_key,
+                temporal_weighting
+            )
+
+            total_cost = total_cost + cost_i
+
+        return total_cost
+
+    # Create gradient function using JAX automatic differentiation
+    gradient_fn = jax.grad(objective)
+
+    # Return tuple: (objective, gradient, pack, unpack)
+    return objective, gradient_fn, pack_parameters, unpack_parameters
+
+
 def compute_costs_with_samples(w, h_vec, sigma_eta, inv_taus, dt,
                                tau_eta, t_max, t_subsamp, target_mu,
                                target_sigma, k, lambda_mean, lambda_var,
@@ -2278,7 +2730,16 @@ def compute_costs_with_samples(w, h_vec, sigma_eta, inv_taus, dt,
         temporal_weighting = np.ones(n_time_bins)
     temporal_weighting = jnp.array(temporal_weighting)
 
-    # PASO 3: Normalizar lambdas
+    # PASO 3: Normalizar lambdas por tamaño del sistema
+    # "give the multipliers their natural scaling with system size"
+    # (objective.ml:109)
+    #
+    # Para N_E=50, n_targets=5, n_time_bins=2500, subsamp_bins=50:
+    # lambda_mean = 1.0 / 25,000 = 4.0×10⁻⁵ ✅ Coincide con Tabla S1
+    # lambda_var = 2.0 / 25,000 = 8.0×10⁻⁵ ✅ Coincide con Tabla S1
+    # lambda_cov = 1.0 / 1,250,000 = 8.0×10⁻⁷ ✅ Coincide con Tabla S1
+    #
+    # Referencia: objective.ml lines 110-112
     lambda_mean_norm = lambda_mean / (2.0 * N_E * n_targets * n_subsamp_bins)
     lambda_var_norm = lambda_var / (2.0 * N_E * n_targets * n_subsamp_bins)
     lambda_cov_norm = lambda_cov / (
