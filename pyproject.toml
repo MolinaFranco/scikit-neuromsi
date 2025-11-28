@@ -79,6 +79,7 @@ dependencies = [
     "scipy",
     "jaxlib",
     "jax",
+    "optax",       # JAX optimization library (ADAM, etc.)
     "joblib",
     "bidict",
     "seaborn",

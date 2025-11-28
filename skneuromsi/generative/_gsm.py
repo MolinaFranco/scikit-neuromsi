@@ -171,7 +171,8 @@ class GSM:
     correlation_strength : float, optional
         Strength of orientation correlations. Default: 0.5.
     noise_variance : float, optional
-        Variance of observation noise. Default: 0.01.
+        Variance of observation noise. Default: 100.0 (σ_x² = 10²).
+        Ref: GSM.py line 302 (s_x = 10.0).
     random_seed : int, optional
         Random seed for reproducibility. Default: None.
     """
@@ -299,7 +300,9 @@ class GSM:
             np.random.seed(random_seed)
         self._random_state = np.random.RandomState(random_seed)
 
-    def generate_stimulus_patch(self, contrast, add_noise=True):
+    def generate_stimulus_patch(
+        self, contrast, add_noise=True, y=None, mode="sampled", y_mean=None
+    ):
         """Generate a single stimulus patch with given contrast.
 
         Parameters
@@ -310,9 +313,18 @@ class GSM:
             Whether to add observation noise to the patch. Default: True.
             Set to False to replicate Echeveste's target generation workflow
             (GSM.py lines 363-364), where targets are generated without
-            observation noise. This is important because for low contrasts
-            (z < 0.5), the noise σ_η=10 dominates the signal and prevents
-            monotonic growth of h with contrast.
+            observation noise.
+        y : np.ndarray, optional
+            If provided, use this latent representation instead of sampling.
+            Shape: (n_orientations,). Default: None.
+        mode : str, optional
+            How to generate y if not provided. Options:
+            - "sampled": Sample y from N(y_mean, C) (default)
+            - "bump": Generate a Gaussian bump centered at n_orientations//2
+        y_mean : np.ndarray or float, optional
+            Mean for sampling y. If float, uses constant mean.
+            If None, uses zeros. Default: None.
+            Ref: div_norm_data_GSM.py line 345: mean = average(original_bump)
 
         Returns
         -------
@@ -327,14 +339,36 @@ class GSM:
         Echeveste et al. (2020) generates training targets WITHOUT noise
         to avoid the signal-to-noise ratio problems at low contrasts.
         For z=0.125, SNR ≈ 0.5 (noise is 2x the signal).
+
+        The "sampled" mode with y_mean replicates div_norm_data_GSM.py
+        behavior where y is sampled from N(mean_array, C) with
+        mean_array = average(original_bump).
+
+        References
+        ----------
+        .. [1] GSM.py lines 334-337: "sampled" mode
+        .. [2] GSM.py lines 339-350: "bumps" mode
+        .. [3] div_norm_data_GSM.py line 345: sampling with offset mean
         """
-        # Sample from prior distribution over orientations eq.2
-        y = self._random_state.multivariate_normal(
-            np.zeros(self.n_orientations), self.C
-        )
+        if y is not None:
+            # Usar el y proporcionado directamente
+            y_used = y.copy()
+        elif mode == "bump":
+            # Generar bump Gaussiano (GSM.py "bumps" mode)
+            y_used = self.generate_bump_stimulus()
+        else:  # mode == "sampled"
+            # Muestrear desde N(y_mean, C)
+            if y_mean is None:
+                mean = np.zeros(self.n_orientations)
+            elif np.isscalar(y_mean):
+                mean = np.full(self.n_orientations, y_mean)
+            else:
+                mean = y_mean
+
+            y_used = self._random_state.multivariate_normal(mean, self.C)
 
         # Generate image patch: x = z * A @ y + noise eq.1
-        clean_patch = contrast * (self.A @ y)
+        clean_patch = contrast * (self.A @ y_used)
 
         if add_noise:
             # Add observation noise (for realistic simulations)
@@ -346,7 +380,7 @@ class GSM:
             # No noise (como Echeveste para targets, GSM.py líneas 363-364)
             x = clean_patch
 
-        return {"x": x, "y": y, "z": contrast}
+        return {"x": x, "y": y_used, "z": contrast}
 
     def generate_h_input_efficient(self, x):
         """Generate SSN input h with trained nonlinearity.
@@ -476,7 +510,7 @@ class GSM:
         transformation applied and include both E and I neurons.
 
         This method loads h_true files directly from the original
-        Echeveste code (h_true_0_learn, h_true_1_learn, h_true_2_learn).
+        Echeveste code.
         These files were generated WITH the transformation already applied.
 
         Parameters
@@ -632,7 +666,127 @@ class GSM:
         """Get the prior covariance matrix (C matrix)."""
         return self.C.copy()
 
-    def compute_posterior_moments(self, x, z_map=None):
+    def generate_bump_stimulus(self, dominant_orientation_idx=None,
+                               amplitude=6.0, width_factor=0.15,
+                               normalize=False):
+        """
+        Generate a Gaussian bump stimulus centered at a specific orientation.
+
+        This method generates a synthetic latent representation y with
+        a Gaussian bump centered at the specified orientation. Each neuron
+        i represents an orientation from -90° to +90°:
+            orientation_deg = -90 + i * (180 / (n_orientations - 1))
+
+        Parameters
+        ----------
+        dominant_orientation_idx : int, optional
+            Index of the dominant orientation (0 to n_orientations-1).
+            Index 0 = -90°, index 25 = ~0°, index 49 = +90°.
+            If None, uses the center (n_orientations // 2 = 25 ≈ 0°).
+        amplitude : float, optional
+            Maximum amplitude of the Gaussian bump (value at the peak).
+            Default: 6.0 (as in GSM.py line 344).
+        width_factor : float, optional
+            Width of the Gaussian as fraction of n_orientations.
+            sigma = width_factor * n_orientations.
+            Default: 0.15 (sigma = 7.5, as in GSM.py line 341).
+        normalize : bool, optional
+            If True, center (subtract mean) and normalize (scale to
+            std=sqrt(C[0,0])) the bump as in GSM.py lines 346-347.
+            Default: False.
+
+            NOTE: This option exists for compatibility with GSM.py code,
+            but the actual data files from Echeveste use normalize=False
+            (raw bump without centering). In practice, always use False.
+
+        Returns
+        -------
+        y : np.ndarray
+            Latent representation with Gaussian bump, shape (n_orientations,).
+            Values represent activation intensity for each orientation.
+
+        Notes
+        -----
+        The formula for the Gaussian bump is:
+            y[i] = amplitude * exp(-0.5 * ((i - center) / sigma)^2)
+
+        Where sigma = width_factor * n_orientations.
+
+        The normalize option (when True) applies GSM.py lines 346-347:
+            y -= mean(y)
+            y *= sqrt(C[0,0]) / std(y)
+
+        However, the actual data files from Echeveste do NOT use this
+        normalization. The y values in the files have mean ≈ 2.25 (not 0),
+        confirming that normalize=False is the correct setting to
+        replicate Echeveste's data.
+
+        References
+        ----------
+        .. [1] ssn_inference_numerical_experiments/GSM/GSM.py lines 339-348
+
+        Examples
+        --------
+        >>> gsm = GSM()
+        >>> # Generate bump at 0° orientation (neuron 25)
+        >>> y = gsm.generate_bump_stimulus(dominant_orientation_idx=25)
+        >>> x = gsm.generate_stimulus_from_y(y, contrast=1.0)
+        """
+        if dominant_orientation_idx is None:
+            dominant_orientation_idx = self.n_orientations // 2
+
+        # Create Gaussian bump
+        # Ref: GSM.py lines 341-344
+        sigma = width_factor * self.n_orientations
+        y = np.zeros(self.n_orientations)
+        for i in range(self.n_orientations):
+            y[i] = amplitude * np.exp(
+                -0.5 * ((i - dominant_orientation_idx) / sigma)**2.0
+            )
+
+        if normalize:
+            # Center (mean = 0) - Ref: GSM.py line 346
+            y -= np.mean(y)
+            # Normalize: std(y) = sqrt(C[0,0]) - Ref: GSM.py line 347
+            y *= (np.sqrt(self.C[0, 0]) / np.std(y))
+
+        return y
+
+    def generate_stimulus_from_y(self, y, contrast, add_noise=False):
+        """
+        Generate stimulus patch from latent representation y.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Latent orientation representation, shape (n_orientations,)
+        contrast : float
+            Contrast level
+        add_noise : bool, optional
+            Whether to add observation noise. Default: False.
+
+        Returns
+        -------
+        x : np.ndarray
+            Generated image patch (flattened), shape (patch_dim,)
+
+        Notes
+        -----
+        Implements x = contrast * A @ y + noise
+        Ref: GSM.py line 364
+        """
+        # Generate clean patch
+        x = contrast * (self.A @ y)
+
+        if add_noise:
+            noise = self._random_state.normal(
+                0, np.sqrt(self.noise_variance), self.patch_dim
+            )
+            x += noise
+
+        return x
+
+    def compute_posterior_moments(self, x, z_map=None, add_baseline=False):
         """
         Compute posterior moments (mean and covariance) for GSM inference.
 
@@ -654,19 +808,31 @@ class GSM:
             Observed image patch (flattened), shape (patch_dim,)
         z_map : float, optional
             MAP estimate of contrast. If None, uses fixed value 0.5
+        add_baseline : bool, optional
+            If True, adds baseline of 3.0 mV to posterior mean for
+            comparison with SSN network (which has non-zero resting state).
+            Default: False.
+            Ref: GSM.py line 236 (baseline = 3.0) and line 468.
 
         Returns
         -------
         mu_post : np.ndarray
-            Posterior mean of orientation representation, shape (n_orient,)
+            Posterior mean of orientation representation,
+            shape (n_orient,). Units: mV (or mV + baseline if
+            add_baseline=True)
         Sigma_post : np.ndarray
-            Posterior covariance matrix, shape (n_orient, n_orient)
+            Posterior covariance matrix in mV², shape (n_orient, n_orient)
 
         Notes
         -----
         Esta función calcula los momentos del posterior condicional
         en el contraste z (asumiendo z conocido o en su valor MAP).
         Para inference completa, se debería integrar sobre P(z|x).
+
+        The baseline of 3.0 mV is added by Echeveste when saving targets
+        for SSN training (GSM.py line 468), but NOT when computing the
+        raw posterior. Use add_baseline=True only when comparing with
+        SSN network outputs.
         """
         # Contraste MAP (por defecto o proporcionado)
         if z_map is None:
@@ -684,6 +850,18 @@ class GSM:
         # Calcular μ_post = (z/σ_x²) * Σ_post * A^T * x
         # (GSM.py line 106-107)
         mu_post = (z_map / s_x_2) * Sigma_post @ (self.A.T @ x)
+
+        # NOTA IMPORTANTE: NO convertir de V a mV aquí
+        # El posterior μ_post está en las unidades correctas directamente.
+        # La covarianza C se escala para tener diagonal ~4 (GSM.py línea 62),
+        # lo que resulta en valores de μ_post en el rango 0-5 mV.
+        # Echeveste añade un baseline de 3.0 mV en GSM.py línea 468,
+        # pero NO multiplica por 1000 en ningún lado.
+        # Ref: GSM.py líneas 107-109, 236, 468
+
+        # Añadir baseline si se solicita (para comparar con red SSN)
+        if add_baseline:
+            mu_post = mu_post + 3.0  # baseline in mV
 
         return mu_post, Sigma_post
 

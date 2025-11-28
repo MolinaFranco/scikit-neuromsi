@@ -54,6 +54,45 @@ from functools import partial
 
 
 # =============================================================================
+# Spatial kernel function (centralized implementation)
+# =============================================================================
+
+def _spatial_kernel_jax(angular_diff, width):
+    """
+    Spatial kernel for connectivity and noise covariance (JAX version).
+
+    This is the centralized JAX implementation of the spatial kernel formula.
+    All connectivity and noise covariance functions use this single source
+    of truth to avoid formula drift.
+
+    Formula: exp[(cos(2*Δθ) - 1) / w²]
+
+    The factor 2 is necessary because:
+    - Our code uses θ ∈ [0, π] (orientations, non-directional)
+    - Original Echeveste code uses θ ∈ [0, 2π] (directions)
+    - cos(2*Δθ) with θ ∈ [0, π] ≡ cos(Δθ) with θ ∈ [0, 2π]
+
+    Parameters
+    ----------
+    angular_diff : jax.Array
+        Angular difference Δθ = θ_i - θ_j in radians
+    width : float
+        Spatial width parameter (d or w) in radians
+
+    Returns
+    -------
+    kernel : jax.Array
+        Spatial kernel values
+
+    References
+    ----------
+    .. [1] Echeveste et al. (2020) Eq. 11
+    .. [2] ssn_inference_optimizer/objective.ml lines 285-287, 303
+    """
+    return jnp.exp((jnp.cos(2 * angular_diff) - 1) / (width**2))
+
+
+# =============================================================================
 # Nonlinear moment functions
 # =============================================================================
 
@@ -1783,13 +1822,13 @@ def create_objective_function(
 
         # Función auxiliar para construir bloques
         # Ref: objective.ml lines 285-287
-        # Formula: W_XY(θi, θj) = s * a * exp[(cos(θi - θj) - 1) / d²]
-        # IMPORTANTE: SIN factor 2 en el coseno (ver Equation 10 del paper)
+        # Formula: W_XY(θi, θj) = s * a * exp[(cos(2*(θi - θj)) - 1) / d²]
+        # Factor 2: Necesario porque usamos θ ∈ [0, π] (orientaciones)
+        # mientras que objective.ml usa θ ∈ [0, 2π]
         def connectivity_block(theta_pre, theta_post, a, d, sign):
             delta = theta_pre[:, None] - theta_post[None, :]
-            return sign * a * jnp.exp(
-                (jnp.cos(delta) - 1) / (d**2)
-            )
+            kernel = _spatial_kernel_jax(delta, d)
+            return sign * a * kernel
 
         # Construir bloques
         W = W.at[:N_E, :N_E].set(
@@ -1852,9 +1891,10 @@ def create_objective_function(
         # Δθ
         delta = theta[:, None] - theta[None, :]
 
-        # Spatial kernel: exp((cos(Δθ) - 1) / d_σ²)
-        # Ref: objective.ml line 303
-        spatial_kernel = jnp.exp((jnp.cos(delta) - 1) / (width**2))
+        # Spatial kernel: exp((cos(2*Δθ) - 1) / d_σ²)
+        # Factor 2 porque usamos θ ∈ [0, π]
+        # Ref: objective.ml line 303 (usa θ ∈ [0, 2π])
+        spatial_kernel = _spatial_kernel_jax(delta, width)
 
         # Build blocks of the covariance matrix
         # Ref: Echeveste et al. 2020, Eq. 12-13
@@ -2460,11 +2500,11 @@ def create_objective_function_with_samples(
 
         # Función auxiliar para construir bloques
         # Ref: objective.ml lines 285-287
+        # Factor 2 porque usamos θ ∈ [0, π]
         def connectivity_block(theta_pre, theta_post, a, d, sign):
             delta = theta_pre[:, None] - theta_post[None, :]
-            return sign * a * jnp.exp(
-                (jnp.cos(delta) - 1) / (d**2)
-            )
+            kernel = _spatial_kernel_jax(delta, d)
+            return sign * a * kernel
 
         # Construir bloques
         W = W.at[:N_E, :N_E].set(
@@ -2499,8 +2539,8 @@ def create_objective_function_with_samples(
         theta = jnp.linspace(0, jnp.pi, N_E, endpoint=False)
         delta = theta[:, None] - theta[None, :]
 
-        # Spatial kernel
-        spatial_kernel = jnp.exp((jnp.cos(delta) - 1) / (width**2))
+        # Spatial kernel con factor 2 (θ ∈ [0, π])
+        spatial_kernel = _spatial_kernel_jax(delta, width)
 
         # Build blocks
         Sigma_ee = var_e * spatial_kernel

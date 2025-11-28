@@ -8,7 +8,6 @@
 # Full Text:
 #     https://github.com/renatoparedes/scikit-neuromsi/blob/main/LICENSE.txt
 
-import os
 from dataclasses import dataclass
 
 import brainpy as bp
@@ -17,7 +16,6 @@ import numpy as np
 from scipy import stats
 
 from ..core import SKNMSIMethodABC
-from ..data import EchevesteDataLoader
 
 
 @dataclass
@@ -287,6 +285,14 @@ class Echeveste2020(SKNMSIMethodABC):
         self._Sigma_eta = (
             None  # Matriz de covarianza del ruido η (optimizada en Stage 2)
         )
+
+        # Input transformation parameters (Stage 2 optimization)
+        self._input_scaling = None  # α_h
+        self._input_baseline = None  # β_h
+        self._input_nl_pow = None  # γ_h
+
+        # Noise covariance parameters (Stage 2 optimization)
+        self._noise_params = None  # Dict con var_e, var_i, var_width, rho
 
         # Training state tracking
         self._is_trained = False
@@ -640,14 +646,11 @@ class Echeveste2020(SKNMSIMethodABC):
             theta = jnp.linspace(0, jnp.pi, self._N_E, endpoint=False)
 
             # Función auxiliar para construir bloques
-            # Ref: objective.ml lines 285-287
-            # Formula: W_XY(θi, θj) = s * a * exp[(cos(θi - θj) - 1) / d²]
-            # IMPORTANTE: SIN factor 2 en coseno (ver Equation 10 paper)
+            # Usa _spatial_kernel_jax como single source of truth
             def connectivity_block(theta_pre, theta_post, a, d, sign):
                 delta = theta_pre[:, None] - theta_post[None, :]
-                return sign * a * jnp.exp(
-                    (jnp.cos(delta) - 1) / (d**2)
-                )
+                kernel = Echeveste2020._spatial_kernel_jax(delta, d)
+                return sign * a * kernel
 
             # Construir bloques
             W = jnp.zeros((self._N, self._N))
@@ -686,9 +689,9 @@ class Echeveste2020(SKNMSIMethodABC):
             theta = jnp.linspace(0, jnp.pi, self._N_E, endpoint=False)
             delta = theta[:, None] - theta[None, :]
 
-            # Kernel espacial
-            spatial_kernel = jnp.exp(
-                (jnp.cos(delta) - 1) / (noise_width**2)
+            # Usa _spatial_kernel_jax como single source of truth
+            spatial_kernel = Echeveste2020._spatial_kernel_jax(
+                delta, noise_width
             )
 
             # Construir bloques
@@ -793,11 +796,32 @@ class Echeveste2020(SKNMSIMethodABC):
         # Inicializar parámetros
         x = x0.copy()
 
-        # Inicializar momentos de ADAM
-        # ADAM mantiene promedios móviles exponenciales de gradientes
-        # (m) y gradientes al cuadrado (v)
-        m = jnp.zeros_like(x)  # First moment (mean of gradients)
-        v = jnp.zeros_like(x)  # Second moment (uncentered variance)
+        # =================================================================
+        # Inicializar ADAM optimizer usando Optax
+        # Ref: Código original usa biblioteca externa de OCaml
+        # (train.ml:288-293), nosotros usamos Optax (estándar JAX)
+        # =================================================================
+        import optax
+
+        # Crear optimizador ADAM con hiperparámetros del paper
+        # train.ml lines 288-292:
+        # - eta = 0.002 (learning rate)
+        # - beta1 = 0.9, beta2 = 0.999 (ADAM betas)
+        # - epsilon = 1e-8 (ADAM epsilon)
+        optimizer = optax.adam(
+            learning_rate=eta,
+            b1=beta1,
+            b2=beta2,
+            eps=epsilon_adam
+        )
+        opt_state = optimizer.init(x)
+
+        # TODELETE: Manual ADAM implementation (reemplazado por Optax)
+        # # Inicializar momentos de ADAM
+        # # ADAM mantiene promedios móviles exponenciales de gradientes
+        # # (m) y gradientes al cuadrado (v)
+        # m = jnp.zeros_like(x)  # First moment (mean of gradients)
+        # v = jnp.zeros_like(x)  # Second moment (uncentered variance)
 
         # Gradient clipping
         # train.ml line 292: clip = sqrt(n_prms) * 5
@@ -838,39 +862,64 @@ class Echeveste2020(SKNMSIMethodABC):
             # OPTIMIZACIÓN: Evita doble evaluación forward+backward
             cost, grad = cost_and_grad_fn(x, iteration, subkey)
 
-            # Convertir a numpy para manipulación
-            # OPTIMIZACIÓN: Libera arrays JAX intermediate
-            grad = np.array(grad)
+            # Convertir a numpy para obtener escalar
             cost_val = float(cost)
 
+            # =============================================================
+            # ADAM update usando Optax
+            # Ref: train.ml:288-293 usa Adam.min (biblioteca externa OCaml)
+            # Nosotros usamos optax.adam (biblioteca estándar JAX)
+            # =============================================================
+
             # Gradient clipping para estabilidad
-            # train.ml line 261
-            grad_norm = np.linalg.norm(grad)
+            # train.ml line 292: clip = sqrt(n_prms) * 5
+            grad_norm = jnp.linalg.norm(grad)
             if grad_norm > grad_clip:
                 grad = grad * (grad_clip / grad_norm)
 
-            # ADAM update en numpy para evitar acumulación de JAX arrays
-            # OPTIMIZACIÓN: Trabajar en numpy reduce presión de memoria JAX
-            # Ref: DIAGNOSTICO_OOM_STAGE1.md
-            m_np = np.array(m)
-            v_np = np.array(v)
-            x_np = np.array(x)
+            # ADAM update con Optax
+            # Optax maneja internamente:
+            # - First moment estimation (m)
+            # - Second moment estimation (v)
+            # - Bias correction
+            # - Parameter update
+            # Equivalente a Kingma & Ba (2015) Algorithm 1
+            updates, opt_state = optimizer.update(grad, opt_state, x)
+            x = optax.apply_updates(x, updates)
 
-            # Paper referencias: Kingma & Ba (2015)
-            m_np = beta1 * m_np + (1 - beta1) * grad
-            v_np = beta2 * v_np + (1 - beta2) * (grad ** 2)
-
-            # Bias correction
-            m_hat = m_np / (1 - beta1 ** iteration)
-            v_hat = v_np / (1 - beta2 ** iteration)
-
-            # Parameter update
-            x_np = x_np - eta * m_hat / (np.sqrt(v_hat) + epsilon_adam)
-
-            # Convertir de vuelta a JAX (necesario para bounds)
-            x = jnp.array(x_np)
-            m = jnp.array(m_np)
-            v = jnp.array(v_np)
+            # TODELETE: Manual ADAM update (reemplazado por Optax)
+            # # Convertir a numpy para manipulación
+            # # OPTIMIZACIÓN: Libera arrays JAX intermediate
+            # grad = np.array(grad)
+            #
+            # # Gradient clipping para estabilidad
+            # # train.ml line 261
+            # grad_norm = np.linalg.norm(grad)
+            # if grad_norm > grad_clip:
+            #     grad = grad * (grad_clip / grad_norm)
+            #
+            # # ADAM update en numpy para evitar acumulación de JAX arrays
+            # # OPTIMIZACIÓN: Trabajar en numpy reduce presión de memoria JAX
+            # # Ref: DIAGNOSTICO_OOM_STAGE1.md
+            # m_np = np.array(m)
+            # v_np = np.array(v)
+            # x_np = np.array(x)
+            #
+            # # Paper referencias: Kingma & Ba (2015)
+            # m_np = beta1 * m_np + (1 - beta1) * grad
+            # v_np = beta2 * v_np + (1 - beta2) * (grad ** 2)
+            #
+            # # Bias correction
+            # m_hat = m_np / (1 - beta1 ** iteration)
+            # v_hat = v_np / (1 - beta2 ** iteration)
+            #
+            # # Parameter update
+            # x_np = x_np - eta * m_hat / (np.sqrt(v_hat) + epsilon_adam)
+            #
+            # # Convertir de vuelta a JAX (necesario para bounds)
+            # x = jnp.array(x_np)
+            # m = jnp.array(m_np)
+            # v = jnp.array(v_np)
 
             # Apply bounds
             # train.ml lines 235-238: width parameters bounded by sqrt(2)
@@ -896,7 +945,7 @@ class Echeveste2020(SKNMSIMethodABC):
                 print(f"Iteration {iteration:5d} | "
                       f"Cost: {cost_val:.5f} | "
                       f"T_min: {current_t_min*1000:.1f}ms | "
-                      f"||grad||: {grad_norm:.3f}")
+                      f"||grad||: {float(grad_norm):.3f}")
 
             # Limpieza periódica de memoria para evitar OOM
             # OPTIMIZACIÓN: Cada 10 iteraciones limpiamos cachés de JAX
@@ -1240,6 +1289,19 @@ class Echeveste2020(SKNMSIMethodABC):
                 optimized_params['sigma_eta_rho']
             )
 
+            # Actualizar parámetros de transformación de input
+            self._input_scaling = optimized_params['input_scaling']
+            self._input_baseline = optimized_params['input_baseline']
+            self._input_nl_pow = optimized_params['input_nl_pow']
+
+            # Guardar parámetros de ruido (para reconstrucción)
+            self._noise_params = {
+                'var_e': optimized_params['sigma_eta_std_e']**2,
+                'var_i': optimized_params['sigma_eta_std_i']**2,
+                'var_width': optimized_params['sigma_eta_width'],
+                'rho': optimized_params['sigma_eta_rho'],
+            }
+
             print("\n✓ Model parameters updated successfully")
         else:
             print("\n✗ Optimization failed, parameters NOT updated")
@@ -1265,72 +1327,36 @@ class Echeveste2020(SKNMSIMethodABC):
         """
         Build noise covariance matrix.
 
-        Based on objective.ml lines 290-305 (sigma_eta function).
-        Construye la matriz de covarianza del ruido η siguiendo
-        la estructura de Kronecker con kernel espacial exponencial.
+        Now uses vectorized implementation for efficiency.
 
         Parameters
         ----------
         width : float
-            Width parameter for spatial correlation
+            Width parameter for spatial correlation (radians)
         std_e : float
             Standard deviation for excitatory noise
         std_i : float
             Standard deviation for inhibitory noise
         rho : float
-            Cross-correlation between E and I populations
+            Cross-correlation coefficient between E and I populations
 
         Returns
         -------
         np.ndarray
             Noise covariance matrix of shape (2*N_E, 2*N_E)
+
+        Notes
+        -----
+        Delegates to _build_noise_covariance_vectorized for efficient
+        vectorized computation.
+
+        References
+        ----------
+        - objective.ml lines 290-305 (sigma_eta function)
         """
-        n_total = self._N_E * 2  # Total de neuronas E+I
-        Sigma = np.zeros((n_total, n_total))
-
-        # Varianzas
-        var_e = std_e ** 2
-        var_i = std_i ** 2
-
-        # Orientaciones
-        orientations = np.linspace(0, np.pi, self._N_E, endpoint=False)
-
-        for i in range(n_total):
-            for j in range(n_total):
-                # Determinar población (E o I)
-                is_i_exc = i < self._N_E
-                is_j_exc = j < self._N_E
-
-                # Varianza correspondiente
-                if is_i_exc and is_j_exc:
-                    var_ij = var_e
-                elif not is_i_exc and not is_j_exc:
-                    var_ij = var_i
-                else:
-                    var_ij = rho * np.sqrt(var_e * var_i)
-
-                # Índices en el ring
-                idx_i = i % self._N_E
-                idx_j = j % self._N_E
-
-                # Diferencia de orientación
-                theta_i = orientations[idx_i]
-                theta_j = orientations[idx_j]
-                cos_diff_minus_one = np.cos(theta_i - theta_j) - 1.0
-
-                # Kernel espacial exponencial
-                # objective.ml line 303
-                spatial_kernel = np.exp(
-                    cos_diff_minus_one / (width ** 2)
-                )
-
-                Sigma[i, j] = var_ij * spatial_kernel
-
-        # Agregar pequeño valor a diagonal para estabilidad
-        # objective.ml line 305
-        Sigma += 0.01 * np.eye(n_total)
-
-        return Sigma
+        return self._build_noise_covariance_vectorized(
+            width, std_e, std_i, rho
+        )
 
     def _build_connectivity_matrices(self):
         """
@@ -1379,29 +1405,32 @@ class Echeveste2020(SKNMSIMethodABC):
         """
         Build connectivity matrix using parametric formula from Eq. 10.
 
+        Now uses vectorized implementation for efficiency.
+
         Parameters
         ----------
         theta_pre: np.ndarray
-            Orientations of pre-synaptic neurons
+            Orientations of pre-synaptic neurons (radians)
         theta_post: np.ndarray
-            Orientations of post-synaptic neurons
+            Orientations of post-synaptic neurons (radians)
         a_xy: float
             Amplitude parameter
         d_xy: float
-            Width parameter
+            Width parameter (radians)
 
         Returns
         -------
         np.ndarray
-            Connectivity matrix computed from parametric formula
+            Connectivity matrix of shape (len(theta_post), len(theta_pre))
+
+        Notes
+        -----
+        Delegates to _build_parametric_matrix_vectorized for efficient
+        vectorized computation.
         """
-        matrix = np.zeros((len(theta_post), len(theta_pre)))
-        for i, theta_i in enumerate(theta_post):
-            for j, theta_j in enumerate(theta_pre):
-                matrix[i, j] = self.parametric_connectivity(
-                    theta_i, theta_j, a_xy, d_xy
-                )
-        return matrix
+        return self._build_parametric_matrix_vectorized(
+            theta_pre, theta_post, a_xy, d_xy, sign=1.0
+        )
 
     def _get_connectivity_parameters(self):
         """Return dictionary of 8 connectivity parameters."""
@@ -1429,8 +1458,9 @@ class Echeveste2020(SKNMSIMethodABC):
         Compute nonlinear moments for the supralinear activation.
 
         Based on objective.ml lines 254-268.
-        Implementa el cálculo de momentos no lineales necesarios
-        para la evolución de la red bajo activación supralineal.
+        Implements the calculation of nonlinear moments required
+        for the evolution of the network under supralinear activation.
+        Used for the ADF training method
 
         Parameters
         ----------
@@ -1456,17 +1486,25 @@ class Echeveste2020(SKNMSIMethodABC):
         phi = stats.norm.pdf(ratio)  # φ(mu/σ)
         psi = stats.norm.cdf(ratio)  # Ψ(mu/σ)
 
-        # nu1 = μ·Ψ + σ·φ
-        nu1 = mu * psi + sigma_std * phi
+        # Acceder a k desde el integrador
+        k = self._integrator.f.k
 
-        # Hard-coded n=2 (supralinear exponent)
-        # From objective.ml line 267: nu_fun
+        # Basado en objective.ml 261-267 y elementwise_harcoded
+        # methods.py:87
+        # La fórmula para n=2 es:
+        # nu = k * ((μ² + σ²)·Ψ + μ·σ·φ)
+        #    = k * (μ²·Ψ + μ·σ·φ + σ²·Ψ)
+        #
+        # Factorizando como en objective.ml:
+        # nu1 = μ·Ψ + σ·φ  (sin factor k)
         # nu = k * (μ·nu1 + σ²·Ψ)
-        nu = self._k * (mu * nu1 + sigma2 * psi)
+
+        nu1 = mu * psi + sigma_std * phi  # Intermedio SIN factor k
+        nu = k * (mu * nu1 + sigma2 * psi)  # Aplicar k solo UNA vez
 
         # From objective.ml line 268: gamma_fun
-        # gamma = 2k * nu1
-        gamma = 2 * self._k * nu1
+        # gamma = 2*k * nu1  (gamma necesita el factor 2*k)
+        gamma = 2 * k * nu1
 
         return nu, gamma
 
@@ -1542,216 +1580,6 @@ class Echeveste2020(SKNMSIMethodABC):
 
         return params
 
-    def save_parameters(self, output_path):
-        """
-        Save optimized parameters following Echeveste's approach.
-
-        Saves both the 8 parametric values and computed full matrices,
-        matching the structure found in ssn_inference_numerical_experiments.
-
-        Parameters
-        ----------
-        output_path: str
-            Directory path to save parameters
-        """
-        if not self._is_trained:
-            raise ValueError("Model must be trained before saving parameters")
-
-        # Save 8 parametric connectivity parameters (scalar files)
-        params = self._get_connectivity_parameters()
-        for param_name, param_value in params.items():
-            np.savetxt(
-                f"{output_path}/w_{param_name.lower()}_learn", [param_value]
-            )
-
-        # Save full connectivity matrices
-        full_W = self.build_connectivity_matrix()
-        np.savetxt(f"{output_path}/w_learn", full_W)
-
-        # Save noise covariance matrix
-        if self._Sigma_eta is not None:
-            np.savetxt(f"{output_path}/sigma_eta_learn", self._Sigma_eta)
-
-    def load_parameters(self, input_path=None):
-        """
-        Load pre-trained parameters from files or internal data loader.
-
-        Can load from:
-        1. Internal EchevesteDataLoader (if input_path is None)
-        2. External directory path (for custom parameters)
-        3. Full matrix fallback
-
-        Sets training stages based on what parameters are successfully loaded:
-        - Stage 1: Connectivity parameters (8 parametric values)
-        - Stage 2: Noise covariance matrix (Sigma_eta)
-        """
-        # Reset training state
-        self._stage1_completed = False
-        self._stage2_completed = False
-        self._is_trained = False
-
-        # STAGE 1: Load connectivity parameters
-        try:
-            if input_path is None:
-                # Use internal data loader
-                loader = EchevesteDataLoader()
-                params = loader.load_ssn_connectivity_parameters()
-                # Set parametric values from internal loader
-                self._a_EE = params["a_EE"]
-                self._a_EI = params["a_EI"]
-                self._a_IE = params["a_IE"]
-                self._a_II = params["a_II"]
-                self._d_EE = params["d_EE"]
-                self._d_EI = params["d_EI"]
-                self._d_IE = params["d_IE"]
-                self._d_II = params["d_II"]
-                print("Stage 1 parameters loaded from internal data loader")
-
-                # CRITICAL: Also load exact matrix to avoid instability
-                try:
-                    self._W_exact = loader.load_exact_connectivity_matrix()
-                    print(
-                        f"Also loaded exact matrix: "
-                        f"shape {self._W_exact.shape}"
-                    )
-                except FileNotFoundError:
-                    print("Warning: No exact matrix found in internal data")
-            else:
-                # Load from external directory (original behavior)
-                param_mapping = {
-                    "a_ee": "w_ee_height_learn",
-                    "a_ei": "w_ei_height_learn",
-                    "a_ie": "w_ie_height_learn",
-                    "a_ii": "w_ii_height_learn",
-                    "d_ee": "w_ee_width_learn",
-                    "d_ei": "w_ei_width_learn",
-                    "d_ie": "w_ie_width_learn",
-                    "d_ii": "w_ii_width_learn",
-                }
-
-                params = {}
-                for param_key, file_name in param_mapping.items():
-                    params[param_key] = np.loadtxt(
-                        os.path.join(input_path, file_name)
-                    )
-
-                # Set parametric values
-                self._a_EE = params["a_ee"]
-                self._a_EI = params["a_ei"]
-                self._a_IE = params["a_ie"]
-                self._a_II = params["a_ii"]
-                self._d_EE = params["d_ee"]
-                self._d_EI = params["d_ei"]
-                self._d_IE = params["d_ie"]
-                self._d_II = params["d_ii"]
-                print("Stage 1 parameters loaded successfully (connectivity)")
-
-                # Also try to load exact matrix if available
-                try:
-                    w_exact = np.loadtxt(os.path.join(input_path, "w_learn"))
-                    self._W_exact = w_exact
-                    print(
-                        f"Also loaded exact matrix w_learn: "
-                        f"shape {w_exact.shape}"
-                    )
-                except FileNotFoundError:
-                    print("No w_learn file found - using computed matrix")
-
-            # Mark stage 1 as completed first, then build matrices
-            self._stage1_completed = True
-            # Build matrices from parameters
-            self._build_connectivity_matrices()
-
-        except FileNotFoundError as e:
-            if input_path is not None:
-                print(f"Warning: Could not load Stage 1 parameters: {e}")
-                # Try fallback: load full matrix if parametric files not found
-                try:
-                    w_full = np.loadtxt(os.path.join(input_path, "w_learn"))
-                    print("Loaded full connectivity matrix as fallback")
-                    print(f"Full W matrix shape: {w_full.shape}")
-                    # Store the full matrix for use in simulations
-                    self._W_full = w_full
-                    # Store exact original matrix for run() method
-                    self._W_exact = w_full
-                    # Mark as partially trained
-                    self._stage1_completed = True
-                except FileNotFoundError:
-                    print(
-                        """Error: No connectivity parameters found (neither
-                        parametric nor full matrix)"""
-                    )
-            else:
-                print(f"Error loading from internal data loader: {e}")
-
-        # STAGE 2: Load noise parameters
-        try:
-            if input_path is None:
-                # Use internal data loader
-                loader = EchevesteDataLoader()
-                loaded_sigma = loader.load_noise_covariance()
-                # Validate dimensions match current network size
-                if loaded_sigma.shape[0] == self._N:
-                    self._Sigma_eta = loaded_sigma
-                    print(
-                        "Stage 2 parameters loaded from internal data loader"
-                    )
-                else:
-                    print(
-                        f"Warning: Loaded Sigma_eta shape "
-                        f"{loaded_sigma.shape} doesn't match "
-                        f"network size {self._N}"
-                    )
-                    print("Using default noise covariance instead")
-                    self._Sigma_eta = None
-            else:
-                # Load from external directory
-                loaded_sigma = np.loadtxt(
-                    os.path.join(input_path, "sigma_eta_learn")
-                )
-                # Validate dimensions match current network size
-                if loaded_sigma.shape[0] == self._N:
-                    self._Sigma_eta = loaded_sigma
-                    print(
-                        "Stage 2 parameters loaded successfully "
-                        "(noise covariance)"
-                    )
-                else:
-                    print(
-                        f"Warning: External Sigma_eta shape "
-                        f"{loaded_sigma.shape} doesn't match "
-                        f"network size {self._N}"
-                    )
-                    print("Using default noise covariance instead")
-                    self._Sigma_eta = None
-
-            self._stage2_completed = True
-
-        except FileNotFoundError:
-            print(
-                """Warning: noise covariance not found,
-                will use default noise in simulations"""
-            )
-            self._Sigma_eta = None
-
-        # UPDATE TRAINING STATUS
-        # Model is considered fully trained if both stages completed
-        if self._stage1_completed and self._stage2_completed:
-            self._is_trained = True
-            print("Model fully trained - both stages completed")
-        elif self._stage1_completed:
-            print(
-                """Model partially trained -
-                only Stage 1 (connectivity) completed"""
-            )
-        elif self._stage2_completed:
-            print(
-                """Model partially trained -
-                only Stage 2 (noise) completed"""
-            )
-        else:
-            print("Model not trained - no parameters loaded successfully")
-
     def is_trained(self):
         """Check if model has been trained with both stages completed."""
         return self._stage1_completed and self._stage2_completed
@@ -1793,6 +1621,133 @@ class Echeveste2020(SKNMSIMethodABC):
         """Set random number generator."""
         self._random = rng
 
+    def burn_in(
+        self,
+        W,
+        h,
+        u_init,
+        Sigma_eta,
+        burn_in_time=10000.0,
+        eta_init=None,
+    ):
+        """
+        Evolve network to equilibrium WITHOUT recording samples.
+
+        This implements the burn-in procedure from Echeveste et al. (2020)
+        original code (methods.py:383-404, network_evolution function).
+        The burn-in eliminates transient effects from arbitrary initial
+        conditions, ensuring the network starts at steady state.
+
+        Mathematical foundation:
+        - Echeveste et al. (2020), Main paper Eq. 8:
+          τ_α * du_α/dt = -u_α + Σ_β W_αβ r_β + h_α + η_α
+        - Main paper Eq. 9: r_α = k * [u_α]_+^n (supralinear activation)
+        - Main paper Eq. 11: ⟨η(t)η(t+s)ᵀ⟩ = Σᶯexp(-s/τᶯ)
+        - Original code reference: transients.py line 128 uses 100,000 steps
+          (20,000ms), activity_example.py line 99 uses 50,000 steps (10,000ms)
+
+        Parameters
+        ----------
+        W : array (N, N)
+            Connectivity matrix
+        h : array (N,)
+            Input to network (typically h_baseline for spontaneous activity)
+        u_init : array (N,)
+            Initial membrane potentials
+        Sigma_eta : array (N, N)
+            Noise covariance matrix
+        burn_in_time : float, default=10000.0
+            Time in milliseconds for burn-in evolution
+            Default 10,000ms matches activity_example.py (50,000 steps * 0.2ms)
+            For transients experiments, use 20,000ms (transients.py uses
+            100,000 steps)
+        eta_init : array (N,) or None, default=None
+            Initial noise state. If None, samples from N(0, Sigma_eta)
+
+        Returns
+        -------
+        u_equilibrium : array (N,)
+            Equilibrated membrane potential after burn-in
+        eta_equilibrium : array (N,)
+            Equilibrated noise state after burn-in
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Nature Neuroscience
+        .. [2] ssn_inference_numerical_experiments/SSN/methods.py:383-404
+        .. [3] ssn_inference_numerical_experiments/SSN/transients.py:128
+        .. [4] ssn_inference_numerical_experiments/SSN/activity_example.py:99
+        """
+        # Convertir tiempo a pasos
+        dt = self._time_res / 1000.0  # ms a segundos
+        steps_max = int(burn_in_time / self._time_res)
+
+        # Inicializar estados
+        u_old = np.copy(u_init)
+
+        # Inicializar ruido
+        if eta_init is None:
+            eta_old = self._random.multivariate_normal(
+                np.zeros(self._N), Sigma_eta
+            )
+        else:
+            eta_old = np.copy(eta_init)
+
+        # Descomposición Cholesky para ruido correlacionado
+        # Original code: methods.py:388
+        L = np.linalg.cholesky(Sigma_eta)
+
+        # Coeficientes para actualización temporal del ruido
+        # Original code: methods.py:390-391
+        tau_n_inv = 1.0 / self._integrator.f.tau_n
+        eps_1 = 1.0 - dt * tau_n_inv
+        eps_2 = np.sqrt(2.0 * dt * tau_n_inv)
+
+        # Loop de evolución (NO guarda muestras)
+        # Original code: methods.py:393-400
+        steps = 0
+        while steps < steps_max:
+            steps += 1
+
+            # Calcular actividad (Eq. 9)
+            r_e = self._integrator.f.supralinear_activation(
+                u_old[:self._N_E]
+            )
+            r_i = self._integrator.f.supralinear_activation(
+                u_old[self._N_E:]
+            )
+            _ = bp.math.concatenate([r_e, r_i])  # noqa: F841
+
+            # Generar ruido (methods.py:396)
+            temp = bp.math.matmul(
+                L, self._random.normal(loc=0.0, scale=1.0, size=self._N)
+            )
+
+            # Actualizar ruido correlacionado (methods.py:397)
+            eta_new = eps_1 * eta_old + eps_2 * temp
+
+            # Actualizar potenciales (Eq. 8, methods.py:398)
+            u_e_old, u_i_old = u_old[:self._N_E], u_old[self._N_E:]
+            u_e_new, u_i_new = self._integrator(
+                u_e_old, u_i_old, steps * dt, W, h, eta_old
+            )
+            u_new = bp.math.concatenate([u_e_new, u_i_new])
+
+            # Actualizar estados
+            u_old = np.array(u_new)
+            eta_old = np.array(eta_new)
+
+            # Verificar estabilidad (methods.py:401-402)
+            if np.linalg.norm(u_new) > 1000:
+                print(f"Warning: Activity exploding during burn-in "
+                      f"at step {steps}")
+                break
+
+        print(f"Burn-in completed: {steps} steps "
+              f"({steps * self._time_res:.1f}ms)")
+
+        return u_old, eta_old
+
     def run(
         self,
         *,
@@ -1800,6 +1755,8 @@ class Echeveste2020(SKNMSIMethodABC):
         stimulus_orientation=0.0,  # Orientación del estímulo G en GSM
         noise_level=0.1,  # Nivel de ruido η para inferencia
         simulation_time=1000.0,  # Tiempo de simulación en ms
+        # Parámetros de burn-in
+        burn_in_time=10000.0,  # ms: Tiempo de burn-in (default 10s)
         # Parámetros para estructura de tres fases (transientes)
         use_three_phases=False,  # Si True, usa transientes como código orig
         t_init=225.0,  # ms: Pre-stimulus spontaneous activity
@@ -1808,6 +1765,7 @@ class Echeveste2020(SKNMSIMethodABC):
         use_delays=False,  # Si True, usa delays por neurona en transiciones
         mean_delay=45.0,  # ms: Delay promedio para transiciones
         delay_sd=5.0,  # ms: Desviación estándar de delays
+        h_input=None,  # Custom h_input vector (shape: N_E or N_E+N_I)
         **kwargs,  # Parámetros adicionales
     ):
         """
@@ -1835,10 +1793,21 @@ class Echeveste2020(SKNMSIMethodABC):
         stimulus_orientation : float, default=0.0
             Orientation G of the GSM stimulus (radians)
         noise_level : float, default=0.1
-            Noise level η for inference
+            Noise level η for inference.
+            IMPORTANT: When trained parameters are loaded (i.e.,
+            self._Sigma_eta is not None), this parameter is IGNORED for
+            the noise covariance matrix, as Σᶯ is already optimized and
+            stored with the correct scale. The parameter only affects the
+            fallback case when no trained Σᶯ is available (uses σ²I)
         simulation_time : float, default=1000.0
             Total simulation time in ms (for single-phase mode)
             Ignored in three-phase mode (uses t_init+t_stimulus+t_final)
+        burn_in_time : float, default=10000.0
+            Time in milliseconds for burn-in evolution
+            Default 10,000ms matches activity_example.py
+            For transients experiments (use_three_phases=True), consider
+            using 20,000ms to match transients.py
+            Reference: methods.py:383 (network_evolution)
         use_three_phases : bool, default=False
             If True, uses three-phase temporal structure (transients)
             If False, uses single-phase with constant stimulus (training)
@@ -1864,6 +1833,17 @@ class Echeveste2020(SKNMSIMethodABC):
         delay_sd : float, default=5.0
             Standard deviation of delays in ms
             Reference: transients.py line 52
+        h_input : array_like or None, default=None
+            Custom stimulus input vector. If provided, overrides the
+            automatic generation via _generate_gsm_stimulus().
+            Shape can be either:
+            - (N_E,): will be duplicated for inhibitory neurons [h, h]
+            - (N_E + N_I,): used directly as full stimulus vector
+            When using h_input, stimulus_contrast and stimulus_orientation
+            are ignored for the stimulus generation (but still recorded
+            in the output metadata).
+            Useful for testing custom stimuli like varying width_factor
+            in generate_bump_stimulus().
 
         Returns
         -------
@@ -1883,216 +1863,132 @@ class Echeveste2020(SKNMSIMethodABC):
                 Use train() or load_parameters() method first."""
             )
 
-        try:
-            # Generate stimuli following Echeveste et al. (2020)
-            # Mathematical foundation:
-            # - Main paper, Eq. 1-7: I = z * G where z is contrast,
-            # G is oriented field
-            # - Main paper, Section 2.1: "Gaussian Scale Mixture (GSM) model"
-            # - Supplementary Material:
-            # "Visual input through GSM generative model"
+        # =====================================================================
+        # PREPARACIÓN DE ESTÍMULOS Y CONECTIVIDAD
+        # =====================================================================
+        # Generate stimuli following Echeveste et al. (2020)
+        # Reference: Main paper Eq. 1-7, transients.py lines 88-102
 
-            # Generar estímulo con contraste (h_final en código original)
-            # Reference: transients.py lines 97-102
-            h_stimulus = self._generate_gsm_stimulus(
-                stimulus_contrast,
-                stimulus_orientation,
-            )
+        # Siempre generar baseline (contraste 0, actividad espontánea)
+        h_baseline = self._generate_gsm_stimulus(0.0, 0.0)
 
-            # Generar baseline para actividad espontánea
-            # (h_0 en código original)
-            # Reference: transients.py lines 88, 93
-            # En el código original, h_0 corresponde al estímulo para
-            # contrast=0 que representa actividad espontánea sin estímulo
-            # visual
-            h_baseline = self._generate_gsm_stimulus(
-                0.0,  # Contraste cero para actividad espontánea
-                0.0,  # Orientación irrelevante para contraste cero
-            )
+        # Determinar h_stimulus: usar h_input personalizado o generar desde GSM
+        if h_input is not None:
+            # Usar h_input personalizado
+            h_input = np.asarray(h_input)
 
-            # Validate stimulus dimensions
-            expected_stimulus_size = self._N_E + self._N_I
-            if len(h_stimulus) != expected_stimulus_size:
-                raise ValueError(
-                    f"Stimulus dimension mismatch. Expected "
-                    f"{expected_stimulus_size}, got {len(h_stimulus)}. "
-                    f"Network: {self._N_E}E + {self._N_I}I = "
-                    f"{expected_stimulus_size} total."
-                )
-            if len(h_baseline) != expected_stimulus_size:
-                raise ValueError(
-                    f"Baseline dimension mismatch. Expected "
-                    f"{expected_stimulus_size}, got {len(h_baseline)}. "
-                    f"Network: {self._N_E}E + {self._N_I}I = "
-                    f"{expected_stimulus_size} total."
-                )
-
-        except Exception as e:
-            if (
-                "dimension mismatch" in str(e).lower()
-                or "stimulus" in str(e).lower()
-            ):
-                raise  # Re-raise stimulus generation errors with clear message
+            # Validar y ajustar dimensiones
+            if len(h_input) == self._N_E:
+                # Solo neuronas E: duplicar para I (como en código original)
+                # Ref: generalization.py:115-116 h = np.concatenate((h,h))
+                h_stimulus = np.concatenate([h_input, h_input])
+                print(f"Using custom h_input (shape {self._N_E}), "
+                      f"duplicated for I neurons")
+            elif len(h_input) == self._N:
+                # Vector completo E+I: usar directamente
+                h_stimulus = h_input
+                print(f"Using custom h_input (shape {self._N})")
             else:
-                raise RuntimeError(
-                    f"Failed to generate stimulus for SSN simulation: {e}. "
-                    f"Network configuration: {self._N_E}E + "
-                    f"{self._N_I}I = {self._N_E + self._N_I} total."
-                ) from e
-
-        try:
-            # FIX: Use exact same connectivity matrix as original
-            # The original code uses pre-computed w_learn matrix
-            # Our build_connectivity_matrix() differs by up to 0.339
-            if hasattr(self, "_W_exact") and self._W_exact is not None:
-                # Use the exact original matrix if loaded
-                W = self._W_exact
-            else:
-                # Fallback to computed matrix (may cause instability)
-                W = self.build_connectivity_matrix()
-
-            # Validate connectivity matrix dimensions
-            expected_W_shape = (self._N_E + self._N_I, self._N_E + self._N_I)
-            if W.shape != expected_W_shape:
                 raise ValueError(
-                    f"Connectivity matrix dimension mismatch. Expected "
-                    f"{expected_W_shape}, got {W.shape}. "
-                    f"Network: {self._N_E}E + {self._N_I}I = "
-                    f"{self._N_E + self._N_I} total."
+                    f"h_input must have shape ({self._N_E},) or ({self._N},), "
+                    f"got ({len(h_input)},)"
                 )
-
-        except Exception as e:
-            if (
-                "dimension mismatch" in str(e).lower()
-                or "connectivity" in str(e).lower()
-            ):
-                raise  # Re-raise connectivity matrix errors with clear message
-            else:
-                raise RuntimeError(
-                    f"Failed to build connectivity matrix: {e}. "
-                    f"Network configuration: {self._N_E}E + "
-                    f"{self._N_I}I = {self._N_E + self._N_I} total. "
-                    f"Ensure model parameters are properly loaded."
-                ) from e
-
-        # Main paper Eq. 8: Variables de estado u_α(t=0)
-        # Los estados iniciales de las neuronas u(0) se toman de una
-        # distribución normal multivariada con μ₀=0 y Σ₀=4I
-
-        # Crear matriz de covarianza Σ₀ = 4I para estados iniciales
-        total_neurons = self._N_E + self._N_I
-        mu_0 = np.zeros(total_neurons)  # Media μ₀ = 0
-        Sigma_0 = 4.0 * np.eye(total_neurons)  # Covarianza Σ₀ = 4I
-
-        # Generar estados iniciales desde distribución normal multivariada
-        u_0 = np.random.multivariate_normal(mu_0, Sigma_0)
-
-        # Main paper Eq. 11: ⟨η(t)η(t+s)ᵀ⟩ = Σᶯexp(-s/τᶯ)
-        # donde τᶯ = 20ms (Table S1)
-        # Main paper p.15: "Σᶯ was the stationary (zero-lag)
-        # covariance matrix"
-        if self._Sigma_eta is not None:
-            # Usa matriz de covarianza Σᶯ entrenada
-            # (referida en Supp. Table S1)
-            Sigma_eta = self._Sigma_eta * noise_level
         else:
-            # Fallback: Supp. p.7 "Σᶯ = σ²I" (aproximación simplificada)
-            Sigma_eta = noise_level * np.eye(self._N)
+            # Generar h_stimulus desde GSM (comportamiento original)
+            h_stimulus = self._generate_gsm_stimulus(
+                stimulus_contrast, stimulus_orientation
+            )
 
-        # NOTA: El código original de Echeveste carga directamente
-        # Sigma_eta pre-calculada desde "sigma_eta_learn"
-        # que fue optimizada durante Stage 2 del entrenamiento
-        # Ver methods.py:388 y full_net.py:51 del código original
+        # Validar dimensiones de estímulos
+        self._validate_stimulus_dimensions(h_stimulus, "Stimulus")
+        self._validate_stimulus_dimensions(h_baseline, "Baseline")
 
-        # La matriz Sigma_eta ya está calculada arriba usando
-        # la implementación disponible
-        # (cargada desde parámetros o construida como identidad escalada)
+        # Obtener matriz de conectividad
+        # Reference: objective.ml, usa w_learn pre-computada
+        W = (self._W_exact if hasattr(self, "_W_exact")
+             and self._W_exact is not None
+             else self.build_connectivity_matrix())
 
-        # Descomposición Cholesky para generar ruido correlacionado
-        # (código original methods.py:398)
-        # Permite generar η~N(0,Sigma_eta) a partir de
-        # z~N(0,I) mediante η = L @ z
-        #
-        # Tiempo de resolución (necesario para three_phases incluso sin ruido)
+        # Validar dimensiones de conectividad
+        expected_W_shape = (self._N, self._N)
+        if W.shape != expected_W_shape:
+            raise ValueError(
+                f"Connectivity matrix dimension mismatch. Expected "
+                f"{expected_W_shape}, got {W.shape}."
+            )
+
+        # =====================================================================
+        # PREPARACIÓN DE MATRICES DE RUIDO
+        # =====================================================================
+        # Reference: Main paper Eq. 11, Table S1 (τᶯ = 20ms)
+        # methods.py:388 usa Sigma_eta directamente sin escalado
+        Sigma_eta = (self._Sigma_eta if self._Sigma_eta is not None
+                     else noise_level * np.eye(self._N))
+
         dt = self._time_res / 1000.0  # Convierte ms a segundos
 
-        # IMPORTANTE: Solo calcular si noise_level > 0
-        # Si noise_level = 0, Sigma_eta es matriz de ceros
-        # y Cholesky falla (no es definida positiva)
-        if noise_level > 0:
+        # =====================================================================
+        # BURN-IN: Evolucionar red a equilibrio antes de registrar
+        # =====================================================================
+        # Reference: transients.py:128, activity_example.py:99
+        # Condiciones iniciales: u(0) ~ N(0, 4I)
+        u_init = np.random.multivariate_normal(
+            np.zeros(self._N), 4.0 * np.eye(self._N)
+        )
+
+        print(f"Starting burn-in: {burn_in_time:.1f}ms...")
+        u_0, eta_0 = self.burn_in(
+            W=W, h=h_baseline, u_init=u_init,
+            Sigma_eta=Sigma_eta, burn_in_time=burn_in_time, eta_init=None
+        )
+
+        # =====================================================================
+        # PREPARACIÓN DE COEFICIENTES PARA INTEGRACIÓN TEMPORAL
+        # =====================================================================
+        # Reference: Main paper Eq. 11, methods.py:402-403
+        # Proceso Ornstein-Uhlenbeck para ruido correlacionado
+        has_noise = noise_level > 0
+        if has_noise:
             L = np.linalg.cholesky(Sigma_eta)
-
-            # correlación temporal del ruido η(t)
-            # Main paper Eq. 11: ⟨η(t) η(t + s)^T⟩ = Σ_η exp(−s/τ_η)
-            # Implementación temporal siguiendo código original
-            # methods.py:402-403
-
-            tau_n_inv = (
-                1.0 / self._integrator.f.tau_n
-            )  # τ_η^(-1), con τ_η = 0.02s (20ms, Table S1)
-
-            # Coeficientes para actualización temporal
-            # (código original methods.py:402-403)
-            # Aproximación e^(-dt/τ_η) ≈ 1-dt/τ_η
-            eps_1 = 1.0 - dt * tau_n_inv
-            # Factor para mantener varianza estacionaria
-            eps_2 = np.sqrt(2.0 * dt * tau_n_inv)
-
-            # CONDICIÓN INICIAL: η(t=0)~N(0,Σᶯ) según Main paper Eq. 11
-            eta_0 = self._random.multivariate_normal(
-                np.zeros(self._N), Sigma_eta
-            )
+            tau_n_inv = 1.0 / self._integrator.f.tau_n  # τ_η = 20ms
+            eps_1 = 1.0 - dt * tau_n_inv  # e^(-dt/τ_η) ≈ 1-dt/τ_η
+            eps_2 = np.sqrt(2.0 * dt * tau_n_inv)  # Mantener varianza
         else:
-            # Sin ruido: η = 0 para todo tiempo
             L = None
-            eps_1 = 0.0
-            eps_2 = 0.0
+            eps_1 = eps_2 = 0.0
             eta_0 = np.zeros(self._N)
 
-        # Implementa loop temporal como en network_evolution()
-        # del código original, Main paper
-        # Eq. 8: τ_α * du_α/dt = -u_α + Σ_β W_αβ r_β + h_α + η_α
-
-        # Determinar estructura temporal según modo
+        # =====================================================================
+        # CONFIGURACIÓN DE ESTRUCTURA TEMPORAL
+        # =====================================================================
+        # Reference: transients.py lines 41-43
         if use_three_phases:
-            # Modo tres fases (transients.py lines 41-43)
             steps_init = int(t_init / self._time_res)
             steps_stimulus = int(t_stimulus / self._time_res)
             steps_final = int(t_final / self._time_res)
             simulation_steps = steps_init + steps_stimulus + steps_final
             total_time_ms = t_init + t_stimulus + t_final
 
-            # Generar delays si se solicitan (transients.py lines 50-60)
+            # Generar delays por neurona si se solicitan
             if use_delays:
-                # Delays en segundos, siguiendo código original
-                mean_delay_sec = mean_delay / 1000.0
-                delay_sd_sec = delay_sd / 1000.0
-
-                # Generar delays para neuronas excitatorias
                 delays = self._random.normal(
-                    mean_delay_sec, delay_sd_sec, self._N_E
+                    mean_delay / 1000.0, delay_sd / 1000.0, self._N_E
                 )
-                delays[delays < 0] = 0.0  # No delays negativos
-
-                # Duplicar para inhibitorias (mismo delay que excitatorias)
-                delays = np.concatenate((delays, delays))
-
-                print("Using per-neuron delays: "
+                delays[delays < 0] = 0.0
+                delays = np.concatenate((delays, delays))  # Duplicar para I
+                print(f"Using per-neuron delays: "
                       f"mean={mean_delay}ms, sd={delay_sd}ms")
             else:
                 delays = np.zeros(self._N)
         else:
-            # Modo single-phase (objetivo: training)
+            # Modo single-phase
             simulation_steps = int(simulation_time / self._time_res)
             total_time_ms = simulation_time
-            # En single-phase, no hay fases ni delays
-            steps_init = 0
+            steps_init = steps_final = 0
             steps_stimulus = simulation_steps
-            steps_final = 0
             delays = np.zeros(self._N)
 
-        print(f"Simulation: {total_time_ms:.1f}ms "
-              f"({simulation_steps} steps)")
+        print(f"Simulation: {total_time_ms:.1f}ms ({simulation_steps} steps)")
         if use_three_phases:
             print(f"  Phase 1 (spontaneous): {t_init:.1f}ms "
                   f"({steps_init} steps)")
@@ -2101,178 +1997,190 @@ class Echeveste2020(SKNMSIMethodABC):
             print(f"  Phase 3 (post-stimulus): {t_final:.1f}ms "
                   f"({steps_final} steps)")
 
-        # Inicialización de variables de estado
-        u_old = np.copy(u_0)  # u(t): potenciales membrana en tiempo t
-        eta_old = np.copy(eta_0)  # η(t): ruido correlacionado en tiempo t
-
-        # Storage para trayectorias temporales
+        # =====================================================================
+        # LOOP TEMPORAL PRINCIPAL
+        # =====================================================================
+        # Reference: methods.py network_evolution(), Main paper Eq. 8
+        u_old = np.copy(u_0)
+        eta_old = np.copy(eta_0)
         u_trajectory = np.zeros((simulation_steps, self._N))
-
-        # Loop temporal principal (siguiendo network_evolution de Echeveste)
         simulation_successful = True
         actual_steps = simulation_steps
 
-        # Determinar fase y estímulo actual basado en timestep
         for step in range(simulation_steps):
-            # Determinar estímulo actual según fase
-            # Reference: transients.py lines 131-145
-            current_time_sec = step * dt  # Tiempo actual en segundos
+            # Determinar estímulo actual según fase y delays
+            h_current = self._get_current_stimulus(
+                step, dt, use_three_phases, use_delays,
+                steps_init, steps_stimulus,
+                h_baseline, h_stimulus, delays
+            )
 
-            if use_three_phases:
-                # FASE 1: Actividad espontánea inicial
-                if step < steps_init:
-                    h_current = h_baseline
-                # FASE 2: Presentación del estímulo
-                elif step < (steps_init + steps_stimulus):
-                    # Aplicar transición con delays si están habilitados
-                    if use_delays:
-                        # Tiempo relativo al inicio de la fase 2
-                        phase2_time = current_time_sec - (steps_init * dt)
-                        h_current = h_baseline.copy()
-                        # Activar estímulo para neuronas que ya "recibieron" h
-                        arrived = delays <= phase2_time
-                        h_current[arrived] = h_stimulus[arrived]
-                    else:
-                        # Sin delays: transición instantánea
-                        h_current = h_stimulus
-                # FASE 3: Retorno a actividad espontánea
-                else:
-                    # Aplicar transición inversa con delays si están
-                    # habilitados
-                    if use_delays:
-                        # Tiempo relativo al inicio de la fase 3
-                        phase3_time = current_time_sec - (
-                            (steps_init + steps_stimulus) * dt
-                        )
-                        h_current = h_stimulus.copy()
-                        # Desactivar estímulo para neuronas que ya "regresaron"
-                        arrived = delays <= phase3_time
-                        h_current[arrived] = h_baseline[arrived]
-                    else:
-                        # Sin delays: transición instantánea
-                        h_current = h_baseline
-            else:
-                # Modo single-phase: estímulo constante
-                h_current = h_stimulus
-
-            # Calcula actividad neuronal usando
-            # función supralineal (Main paper, Eq. 9)
-            # r_α = k * [u_α]_+^n donde k=0.3, n=2.0, [x]_+ = max(0,x)
-            r_e = self._integrator.f.supralinear_activation(
-                u_old[:self._N_E]
-            )  # Excitatorias
-            r_i = self._integrator.f.supralinear_activation(
-                u_old[self._N_E:]
-            )  # Inhibitorias
-            _ = bp.math.concatenate([r_e, r_i])  # noqa: F841
-
-            # Genera ruido blanco Gaussiano independiente para cada neurona
-            # Siguiendo methods.py:413 del código original de Echeveste
-            # IMPORTANTE: Solo si noise_level > 0
-            if noise_level > 0:
+            # Actualizar ruido correlacionado (Ornstein-Uhlenbeck)
+            if has_noise:
                 temp = bp.math.matmul(
                     L, self._random.normal(loc=0.0, scale=1.0, size=self._N)
                 )
-
-                # Actualiza ruido correlacionado (proceso Ornstein-Uhlenbeck)
-                # Siguiendo methods.py:417 del código original
-                # η(t+dt) = eps_1 * η(t) + eps_2 * temp
                 eta_new = eps_1 * eta_old + eps_2 * temp
             else:
-                # Sin ruido: η permanece en cero
-                eta_new = eta_old  # (que ya es cero)
+                eta_new = eta_old
 
-            # Actualiza potenciales usando integrador BrainPy
-            # (Main paper, Eq. 8)
-            # du_α/dt = (-u_α + Σ_β W_αβ r_β + h_α + η_α) / τ_α
-            # IMPORTANTE: Aquí se usa h_current que varía según la fase
-            u_e_old, u_i_old = u_old[:self._N_E], u_old[self._N_E:]
+            # Integrar dinámica: Main paper Eq. 8
             u_e_new, u_i_new = self._integrator(
-                u_e_old, u_i_old, step * dt, W, h_current, eta_old
+                u_old[:self._N_E], u_old[self._N_E:],
+                step * dt, W, h_current, eta_old
             )
             u_new = bp.math.concatenate([u_e_new, u_i_new])
 
-            # Guarda estado actual
             u_trajectory[step] = u_new
+            u_old = bp.math.array(u_new)
+            eta_old = bp.math.array(eta_new)
 
-            # Actualiza variables para siguiente paso temporal
-            u_old = bp.math.array(u_new)  # Use bp.math for GPU support
-            eta_old = bp.math.array(eta_new)  # Use bp.math for GPU support
-
-            # Verificación de estabilidad numérica
-            # (código original: SSN/methods.py:428, 441, 465, 488, 519, 542)
+            # Verificar estabilidad
             if bp.math.linalg.norm(u_new) > 1000:
                 simulation_successful = False
-                actual_steps = step  # Explosion occurred at this step
-                print(
-                    f"Warning: Activity exploded at step "
-                    f"{step}/{simulation_steps}. "
-                    f"Using trajectory up to step {step-1}."
-                )
+                actual_steps = step
+                print(f"Warning: Activity exploded at step "
+                      f"{step}/{simulation_steps}. "
+                      f"Using trajectory up to step {step-1}.")
                 break
 
-        # Handle simulation results based on success/failure
+        # =====================================================================
+        # POST-PROCESAMIENTO Y RESULTADOS
+        # =====================================================================
         if not simulation_successful:
-            # Truncate trajectory to actual simulated steps
             u_trajectory = u_trajectory[:actual_steps]
             if actual_steps == 0:
                 raise RuntimeError(
                     f"Simulation failed immediately. Check network "
                     f"parameters: contrast={stimulus_contrast}, "
-                    f"noise_level={noise_level}. Try reducing "
-                    f"noise_level or stimulus_contrast."
+                    f"noise_level={noise_level}."
                 )
 
-        # EXTRACCIÓN DE ACTIVIDAD NEURONAL Y POTENCIALES DE MEMBRANA
-        # Calcular actividad r_α(t) = k * [u_α(t)]_+^n (Main paper Eq. 9)
-        excitatory_activity = self._integrator.f.supralinear_activation(
-            u_trajectory[:, :self._N_E]  # Solo neuronas excitatorias
-        )
-        inhibitory_activity = self._integrator.f.supralinear_activation(
-            u_trajectory[:, self._N_E:]  # Solo neuronas inhibitorias
-        )
-
-        # Extraer potenciales de membrana u_α(t) (Main paper Eq. 8)
-        excitatory_potential = u_trajectory[:, :self._N_E]
-        inhibitory_potential = u_trajectory[:, self._N_E:]
-
+        # Calcular firing rates: r_α(t) = k * [u_α(t)]_+^n (Eq. 9)
+        activation = self._integrator.f.supralinear_activation
         response = {
-            # Firing rates r_α(t) (Main paper Eq. 9: r = k * [u]_+^n)
-            "excitatory_firing_rate": excitatory_activity,
-            "inhibitory_firing_rate": inhibitory_activity,
-            # Potenciales de membrana u_α(t) (Main paper Eq. 8)
-            "excitatory_potential": excitatory_potential,
-            "inhibitory_potential": inhibitory_potential,
+            "excitatory_firing_rate": activation(
+                u_trajectory[:, :self._N_E]
+            ),
+            "inhibitory_firing_rate": activation(
+                u_trajectory[:, self._N_E:]
+            ),
+            "excitatory_potential": u_trajectory[:, :self._N_E],
+            "inhibitory_potential": u_trajectory[:, self._N_E:],
         }
 
-        # Note: temporal dimension adjustment for truncated simulations
-        # is handled by the custom _make_result method
-
         extra = {
-            # Variable z del modelo GSM (Eq. 2)
             "stimulus_contrast": stimulus_contrast,
-            # Orientación G del modelo GSM (Eq. 3)
             "stimulus_orientation": stimulus_orientation,
-            # Nivel ruido η (Supp. Sec. 2.3)
             "noise_level": noise_level,
-            # Simulation status information
+            "burn_in_time": burn_in_time,
+            "burn_in_steps": int(burn_in_time / self._time_res),
             "simulation_successful": simulation_successful,
             "actual_simulation_steps": actual_steps,
             "requested_simulation_steps": simulation_steps,
             "actual_simulation_time": actual_steps * self._time_res,
             "requested_simulation_time": simulation_time,
-            # Stimulus presentation information
             "use_three_phases": use_three_phases,
             "t_init": t_init if use_three_phases else None,
             "t_stimulus": t_stimulus if use_three_phases else None,
             "t_final": t_final if use_three_phases else None,
             "use_delays": use_delays if use_three_phases else None,
+            "used_custom_h_input": h_input is not None,
+            "h_stimulus": h_stimulus,  # Guardar h usado para referencia
         }
 
-        return (
-            response,
-            extra,
-        )  # Retorna actividad y parámetros del experimento
+        return response, extra
+
+    def _validate_stimulus_dimensions(self, stimulus, name):
+        """
+        Validate stimulus dimensions match network size.
+
+        Parameters
+        ----------
+        stimulus : array_like
+            Stimulus array to validate
+        name : str
+            Name of the stimulus (for error messages)
+
+        Raises
+        ------
+        ValueError
+            If stimulus dimensions don't match network size
+        """
+        expected_size = self._N
+        if len(stimulus) != expected_size:
+            raise ValueError(
+                f"{name} dimension mismatch. Expected {expected_size}, "
+                f"got {len(stimulus)}. Network: {self._N_E}E + {self._N_I}I."
+            )
+
+    def _get_current_stimulus(
+        self, step, dt, use_three_phases, use_delays,
+        steps_init, steps_stimulus,
+        h_baseline, h_stimulus, delays
+    ):
+        """
+        Determine current stimulus based on phase and delays.
+
+        Parameters
+        ----------
+        step : int
+            Current time step
+        dt : float
+            Time resolution in seconds
+        use_three_phases : bool
+            Whether using three-phase temporal structure
+        use_delays : bool
+            Whether using per-neuron delays
+        steps_init : int
+            Steps in initial spontaneous phase
+        steps_stimulus : int
+            Steps in stimulus presentation phase
+        h_baseline : array
+            Baseline stimulus (spontaneous activity)
+        h_stimulus : array
+            Full stimulus
+        delays : array
+            Per-neuron delays in seconds
+
+        Returns
+        -------
+        h_current : array
+            Stimulus for current timestep
+
+        References
+        ----------
+        transients.py lines 131-145
+        """
+        if not use_three_phases:
+            return h_stimulus
+
+        current_time_sec = step * dt
+
+        # Fase 1: Actividad espontánea inicial
+        if step < steps_init:
+            return h_baseline
+
+        # Fase 2: Presentación del estímulo
+        if step < (steps_init + steps_stimulus):
+            if not use_delays:
+                return h_stimulus
+            # Con delays: transición gradual
+            phase2_time = current_time_sec - (steps_init * dt)
+            h_current = h_baseline.copy()
+            arrived = delays <= phase2_time
+            h_current[arrived] = h_stimulus[arrived]
+            return h_current
+
+        # Fase 3: Retorno a actividad espontánea
+        if not use_delays:
+            return h_baseline
+        # Con delays: transición gradual inversa
+        phase3_time = current_time_sec - ((steps_init + steps_stimulus) * dt)
+        h_current = h_stimulus.copy()
+        arrived = delays <= phase3_time
+        h_current[arrived] = h_baseline[arrived]
+        return h_current
 
     def _make_result(
         self,
@@ -2335,31 +2243,205 @@ class Echeveste2020(SKNMSIMethodABC):
             **kwargs,
         )
 
+    # =========================================================================
+    # FUNCIONES KERNEL CENTRALIZADAS (SINGLE SOURCE OF TRUTH)
+    # =========================================================================
+
+    @staticmethod
+    def _spatial_kernel(angular_diff, width):
+        """
+        Spatial kernel for connectivity and noise covariance.
+
+        This is the SINGLE SOURCE OF TRUTH for the spatial kernel formula.
+        All other functions should use this.
+
+        Formula: exp[(cos(2*Δθ) - 1) / w²]
+
+        Parameters
+        ----------
+        angular_diff : float or array
+            Angular difference θi - θj (in radians)
+        width : float
+            Width parameter (in radians)
+
+        Returns
+        -------
+        float or array
+            Kernel value
+
+        Notes
+        -----
+        Factor 2 in cosine is needed because we use θ ∈ [0, π] for
+        orientations (non-directional), while Echeveste's OCaml code
+        uses θ ∈ [0, 2π]. The factor 2 compensates for this difference.
+
+        References
+        ----------
+        - Echeveste et al. 2020, Equation 10
+        - objective.ml lines 285-287 (uses θ ∈ [0, 2π] without factor 2)
+        """
+        return np.exp((np.cos(2 * angular_diff) - 1) / (width**2))
+
+    @staticmethod
+    def _spatial_kernel_jax(angular_diff, width):
+        """
+        JAX version of spatial kernel for efficient training.
+
+        Same formula as _spatial_kernel but using JAX operations.
+
+        Parameters
+        ----------
+        angular_diff : jax.Array
+            Angular difference θi - θj (in radians)
+        width : float
+            Width parameter (in radians)
+
+        Returns
+        -------
+        jax.Array
+            Kernel value
+        """
+        import jax.numpy as jnp
+        return jnp.exp((jnp.cos(2 * angular_diff) - 1) / (width**2))
+
+    def _build_parametric_matrix_vectorized(self, theta_pre, theta_post,
+                                            a_xy, d_xy, sign=1.0):
+        """
+        Build parametric connectivity matrix (vectorized, efficient).
+
+        This replaces ALL loop-based constructions of connectivity blocks.
+
+        Parameters
+        ----------
+        theta_pre : array_like
+            Orientations of pre-synaptic neurons (radians)
+        theta_post : array_like
+            Orientations of post-synaptic neurons (radians)
+        a_xy : float
+            Connectivity amplitude
+        d_xy : float
+            Connectivity width (radians)
+        sign : float, optional
+            Sign of connection (+1 for excitatory, -1 for inhibitory)
+
+        Returns
+        -------
+        np.ndarray
+            Connectivity matrix of shape (len(theta_post), len(theta_pre))
+            where W[i,j] = connection from pre[j] to post[i]
+        """
+        theta_pre = np.asarray(theta_pre)
+        theta_post = np.asarray(theta_post)
+
+        # Compute all pairwise angular differences
+        # Shape: (len(theta_post), len(theta_pre))
+        delta = theta_post[:, None] - theta_pre[None, :]
+
+        # Apply spatial kernel
+        kernel = self._spatial_kernel(delta, d_xy)
+
+        # Apply amplitude and sign
+        return sign * a_xy * kernel
+
+    def _build_noise_covariance_vectorized(self, width, std_e, std_i, rho):
+        """
+        Build noise covariance matrix (vectorized, efficient).
+
+        This replaces the loop-based construction in _build_noise_covariance.
+
+        Parameters
+        ----------
+        width : float
+            Width parameter for spatial correlation (radians)
+        std_e : float
+            Standard deviation for excitatory noise
+        std_i : float
+            Standard deviation for inhibitory noise
+        rho : float
+            Cross-correlation coefficient between E and I populations
+
+        Returns
+        -------
+        np.ndarray
+            Noise covariance matrix of shape (N, N) where N = 2*N_E
+
+        Notes
+        -----
+        Uses _spatial_kernel for consistency with connectivity matrices.
+
+        References
+        ----------
+        - objective.ml lines 290-305 (sigma_eta function)
+        """
+        N_E = self._N_E
+        N = 2 * N_E
+
+        # Generar orientaciones para población E
+        theta = np.linspace(0, np.pi, N_E, endpoint=False)
+
+        # Compute pairwise angular differences
+        delta = theta[:, None] - theta[None, :]
+
+        # Apply spatial kernel
+        spatial_kernel = self._spatial_kernel(delta, width)
+
+        # Compute variances
+        var_e = std_e ** 2
+        var_i = std_i ** 2
+
+        # Build blocks
+        Sigma_ee = var_e * spatial_kernel
+        Sigma_ii = var_i * spatial_kernel
+        Sigma_ei = rho * np.sqrt(var_e * var_i) * spatial_kernel
+        Sigma_ie = Sigma_ei.T  # Symmetric
+
+        # Assemble full matrix
+        Sigma = np.zeros((N, N))
+        Sigma[:N_E, :N_E] = Sigma_ee
+        Sigma[N_E:, N_E:] = Sigma_ii
+        Sigma[:N_E, N_E:] = Sigma_ei
+        Sigma[N_E:, :N_E] = Sigma_ie
+
+        # Add diagonal noise for numerical stability
+        # Ref: objective.ml line 305
+        Sigma += 0.01 * np.eye(N)
+
+        return Sigma
+
     def parametric_connectivity(self, theta_i, theta_j, a_xy, d_xy):
         """
         Calculate parametric connectivity using the formula in Equation 10.
 
-        Implement: W_XY(θi, θj) = a_XY * exp[(cos(θi - θj) - 1) / d_XY²]
-        where:
-        - θi, θj: preferred orientations of neurons i, j (in radians)
-        - a_XY: connectivity amplitude between X→Y populations
-        - d_XY: connectivity width (dispersion parameter)
+        Implement: W_XY(θi, θj) = a_XY * exp[(cos(2*(θi - θj)) - 1) / d_XY²]
 
-        Mathematical foundation:
-        - Main paper, Eq. 10: Parametric connectivity with angular differences
-        - Only 8 parameters: {a_EE, a_EI, a_IE, a_II, d_EE, d_EI, d_IE, d_II}
-        - Circular topology: angular differences θi - θj
-        determine connection strength
-        - Ref: objective.ml lines 285-287 (SIN factor 2 en coseno)
+        Parameters
+        ----------
+        theta_i : float
+            Preferred orientation of neuron i (in radians)
+        theta_j : float
+            Preferred orientation of neuron j (in radians)
+        a_xy : float
+            Connectivity amplitude between X→Y populations
+        d_xy : float
+            Connectivity width (dispersion parameter, in radians)
+
+        Returns
+        -------
+        float
+            Connectivity strength from j to i
+
+        Notes
+        -----
+        Uses _spatial_kernel as single source of truth for the formula.
+
+        References
+        ----------
+        - Echeveste et al. 2020, Equation 10
+        - objective.ml lines 285-287
         """
-        angular_diff = theta_i - theta_j  # Diferencia θi - θj
-
-        exp_term = np.exp((np.cos(angular_diff) - 1) / (d_xy**2))
-
-        # Conectividad final: amplitud × perfil espacial
-        W_xy = a_xy * exp_term
-
-        return W_xy
+        angular_diff = theta_i - theta_j
+        kernel = self._spatial_kernel(angular_diff, d_xy)
+        return a_xy * kernel
 
     def build_connectivity_matrix(self, connectivity_params=None):
         """
@@ -2420,62 +2502,62 @@ class Echeveste2020(SKNMSIMethodABC):
             W_full[self._N_E:, self._N_E:] = self._W_II
             return W_full
 
-        # Genera orientaciones preferidas para ring topology
-        # (Main paper Fig. 1B)
-        # theta[i] = np.pi * i / N (en el caso de 180 grados)
-        theta_e = np.linspace(
-            np.radians(self._position_range[0]),
-            np.radians(self._position_range[1]),
-            self._N_E,
-        )
+        # Construir W exactamente como objective.ml líneas 278-288
+        # IMPORTANTE: Replicar exactamente la lógica de indexación de OCaml
+        # para obtener la matriz idéntica a w_learn
+        #
+        # Código original OCaml (objective.ml:278-288):
+        #   M.init n n (fun i j ->
+        #     let p, s = if i<=m
+        #       then (if j<=m then ee,1 else ei,-1)
+        #       else (if j<=m then ie,1 else ii,-1) in
+        #     let i = (pred i) mod m and j = (pred j) mod m in
+        #     let theta_i = 2*pi*float(i)/float(m) in
+        #     let theta_j = 2*pi*float(j)/float(m) in
+        #     (s*p.height) * exp(cos_diff_minus_one / width²))
+        #
+        # Diferencia clave: OCaml usa índices 1-based (1..n), luego
+        # hace (i-1) mod m para obtener índice angular 0..(m-1)
 
-        theta_i = np.linspace(
-            np.radians(self._position_range[0]),
-            np.radians(self._position_range[1]),
-            self._N_I,
-        )
-
-        # Inicializar matriz W completa (N x N)
         W = np.zeros((self._N, self._N))
 
-        # Construir bloques de conectividad usando parametric_connectivity
-        # Ref: objective.ml lines 285-287
-        # Formula: W_XY(θi, θj) = s * a * exp[(cos(θi - θj) - 1) / d²]
-        # IMPORTANTE: SIN factor 2 en coseno (Echeveste et al. 2020, Eq. 10)
-        def connectivity_block(theta_pre, theta_post, a, d, sign=1):
-            delta_theta = theta_post[:, None] - theta_pre[None, :]
-            return sign * a * np.exp((np.cos(delta_theta) - 1) / d**2)
+        # Determinar m (número de orientaciones por población)
+        # En el caso original: N_E = N_I = m = 50, n = 100
+        m = self._N_E  # Asumimos N_E = N_I como en el original
 
-        # Bloques matriciales con signos correctos según código original
-        # Original: E→E (+), E→I (-), I→E (+), I→I (-)
-        W[0:self._N_E, 0:self._N_E] = connectivity_block(
-            theta_e,
-            theta_e,
-            params["a_EE"],
-            params["d_EE"],
-            sign=1,
-        )
-        W[0:self._N_E, self._N_E:self._N] = connectivity_block(
-            theta_e,
-            theta_i,
-            params["a_EI"],
-            params["d_EI"],
-            sign=-1,
-        )
-        W[self._N_E:self._N, 0:self._N_E] = connectivity_block(
-            theta_i,
-            theta_e,
-            params["a_IE"],
-            params["d_IE"],
-            sign=1,
-        )
-        W[self._N_E:self._N, self._N_E:self._N] = connectivity_block(
-            theta_i,
-            theta_i,
-            params["a_II"],
-            params["d_II"],
-            sign=-1,
-        )
+        # Iterar con índices estilo OCaml (1..n) para replicar exactamente
+        for i_ocaml in range(1, self._N + 1):
+            for j_ocaml in range(1, self._N + 1):
+                # Determinar qué bloque y signo según lógica OCaml
+                # if i<=m then (if j<=m then ee,1 else ei,-1)
+                #         else (if j<=m then ie,1 else ii,-1)
+                if i_ocaml <= m:  # i es E
+                    if j_ocaml <= m:  # j es E → bloque E←E
+                        a, d, sign = (params["a_EE"], params["d_EE"], 1.0)
+                    else:  # j es I → bloque E←I
+                        a, d, sign = (params["a_EI"], params["d_EI"], -1.0)
+                else:  # i es I
+                    if j_ocaml <= m:  # j es E → bloque I←E
+                        a, d, sign = (params["a_IE"], params["d_IE"], 1.0)
+                    else:  # j es I → bloque I←I
+                        a, d, sign = (params["a_II"], params["d_II"], -1.0)
+
+                # Convertir índices OCaml (1-based) a índices angulares
+                # let i = (pred i) mod m → i_angular = (i_ocaml - 1) mod m
+                i_angular = (i_ocaml - 1) % m
+                j_angular = (j_ocaml - 1) % m
+
+                # Calcular ángulos: theta = 2π * i / m
+                theta_i = 2.0 * np.pi * i_angular / m
+                theta_j = 2.0 * np.pi * j_angular / m
+
+                # Diferencia angular
+                cos_diff_minus_one = np.cos(theta_i - theta_j) - 1.0
+
+                # Fórmula de conectividad: (sign * a) * exp(cos_diff/d²)
+                W[i_ocaml - 1, j_ocaml - 1] = (
+                    (sign * a) * np.exp(cos_diff_minus_one / (d ** 2))
+                )
 
         return W
 
@@ -2529,7 +2611,7 @@ class Echeveste2020(SKNMSIMethodABC):
 
         Notes
         -----
-        The precomputed h_true files (h_true_0, h_true_1, h_true_2)
+        The precomputed h_true files
         were generated by div_norm_data_GSM.py WITH the transformation
         already applied. The files contain:
 
@@ -2564,7 +2646,6 @@ class Echeveste2020(SKNMSIMethodABC):
             if use_precomputed:
                 # Map contrast level to file index
                 # Echeveste's contrast levels: [0.0, 0.125, 0.25, 0.5, 1.0]
-                # We have files: h_true_0, h_true_1, h_true_2, h_true_3, h_true_4
                 if contrast < 0.06:
                     contrast_idx = 0  # Spontaneous activity (z=0.0)
                 elif contrast < 0.19:
@@ -3346,3 +3427,336 @@ class Echeveste2020(SKNMSIMethodABC):
                 ],
                 "confidence_scores": confidence_scores[sort_order].tolist(),
             }
+
+    def load_parameters(self, load_exact_matrices=True):
+        """
+        Load all pre-trained parameters from Echeveste et al. (2020).
+
+        This method loads the 15 optimized parameters from the original
+        paper and updates the model's internal state. The parameters can
+        be loaded as exact matrices (w_learn, sigma_eta_learn) or
+        constructed from the parametric form.
+
+        Parameters
+        ----------
+        load_exact_matrices : bool, optional
+            If True (default), loads exact pre-computed matrices
+            (w_learn, sigma_eta_learn).
+            If False, loads individual parameters and constructs matrices.
+
+        Returns
+        -------
+        dict
+            Dictionary with all loaded parameters grouped by category
+
+        Raises
+        ------
+        FileNotFoundError
+            If required parameter files are not found
+
+        Examples
+        --------
+        >>> from skneuromsi.neural import Echeveste2020
+        >>> model = Echeveste2020()
+        >>> params = model.load_parameters()
+        >>> # Model is now ready for simulation
+        >>> results = model.simulate_three_phases(
+        ...     stimulus_contrast=0.5,
+        ...     stimulus_orientation=0.0
+        ... )
+
+        Notes
+        -----
+        After calling this method:
+        - Model is marked as trained (_is_trained = True)
+        - Both Stage 1 and Stage 2 are marked complete
+        - All 15 parameters are loaded and stored
+        - Connectivity matrix W is available
+        - Noise covariance Sigma_eta is available
+
+        References
+        ----------
+        .. [1] Echeveste et al. (2020) Supplementary Table S1
+        .. [2] scikit-neuromsi/skneuromsi/data/echeveste2020/
+        """
+        from ..data import EchevesteDataLoader
+
+        loader = EchevesteDataLoader()
+
+        print("Loading pre-trained parameters from Echeveste et al. (2020)...")
+
+        # 1. Load connectivity parameters (8 params)
+        print("  [1/4] Loading connectivity parameters...")
+        conn_params = loader.load_ssn_connectivity_parameters()
+        self._a_EE = conn_params['a_EE']
+        self._a_EI = conn_params['a_EI']
+        self._a_IE = conn_params['a_IE']
+        self._a_II = conn_params['a_II']
+        self._d_EE = conn_params['d_EE']
+        self._d_EI = conn_params['d_EI']
+        self._d_IE = conn_params['d_IE']
+        self._d_II = conn_params['d_II']
+
+        # Store for future use
+        self._connectivity_params = conn_params
+
+        # 2. Load input transformation parameters (3 params)
+        print("  [2/4] Loading input transformation parameters...")
+        input_params = loader.load_input_transformation_parameters()
+        self._input_scaling = input_params['alpha_h']
+        self._input_baseline = input_params['beta_h']
+        self._input_nl_pow = input_params['gamma_h']
+
+        # 3. Load noise covariance (4 params + matrix)
+        print("  [3/4] Loading noise covariance...")
+        try:
+            noise_params = loader.load_noise_variance_parameters()
+            self._noise_params = noise_params
+        except FileNotFoundError:
+            print("    Warning: Noise parameters not found, "
+                  "will use sigma_eta_learn only")
+            self._noise_params = None
+
+        # Load or construct sigma_eta
+        self._Sigma_eta = loader.load_noise_covariance(
+            fallback_to_construction=True
+        )
+
+        # Mark model as trained BEFORE building matrices
+        # (build methods check these flags)
+        self._stage1_completed = True
+        self._stage2_completed = True
+        self._is_trained = True
+
+        # 4. Load or construct connectivity matrix W
+        print("  [4/4] Loading connectivity matrix...")
+        if load_exact_matrices:
+            self._W_exact = loader.load_connectivity_matrix()
+            # Also build individual blocks for consistency
+            self._build_connectivity_matrices()
+        else:
+            # Build from parameters
+            self._build_connectivity_matrices()
+            self._W_exact = None
+
+        print("✓ Pre-trained parameters loaded successfully")
+        print("  - Connectivity: 8 parameters")
+        print("  - Input transformation: 3 parameters")
+        noise_msg = (
+            '4 parameters + matrix'
+            if self._noise_params else 'matrix only'
+        )
+        print(f"  - Noise covariance: {noise_msg}")
+        print("  - Total: 15 parameters")
+
+        return {
+            'connectivity': conn_params,
+            'input_transformation': input_params,
+            'noise': self._noise_params,
+            'loaded_exact_matrices': load_exact_matrices,
+            'is_trained': self._is_trained,
+        }
+
+    def save_parameters(self, output_dir, save_matrices=True):
+        """
+        Save all trained parameters to files.
+
+        Saves the 15 optimized parameters and optionally the derived
+        matrices (W, Sigma_eta) to the specified directory.
+
+        Parameters
+        ----------
+        output_dir : str or Path
+            Directory where to save the parameter files
+        save_matrices : bool, optional
+            If True (default), also saves the full matrices W and Sigma_eta
+
+        Returns
+        -------
+        dict
+            Dictionary with paths to all saved files
+
+        Raises
+        ------
+        ValueError
+            If model is not trained (no parameters to save)
+        OSError
+            If output directory cannot be created or files cannot be written
+
+        Examples
+        --------
+        >>> from skneuromsi.neural import Echeveste2020
+        >>> model = Echeveste2020()
+        >>> # ... train the model ...
+        >>> saved_files = model.save_parameters('my_trained_model/')
+
+        Notes
+        -----
+        Saved files match the naming convention from Echeveste et al. (2020):
+        - input_scaling, input_baseline, input_nl_pow
+        - w_ee_height_learn, w_ee_width_learn, etc.
+        - var_e_learn, var_i_learn, var_width_learn, rho_learn
+        - w_learn (if save_matrices=True)
+        - sigma_eta_learn (if save_matrices=True)
+        """
+        from pathlib import Path
+        import numpy as np
+
+        if not self._is_trained:
+            raise ValueError(
+                "Model is not trained. Train the model first using "
+                "model.train(gsm_model) or load pre-trained parameters "
+                "using model.load_pretrained_parameters()"
+            )
+
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        saved_files = {}
+
+        print(f"Saving parameters to {output_path}...")
+
+        # 1. Save input transformation parameters (3 files)
+        print("  [1/4] Saving input transformation parameters...")
+        if self._input_scaling is not None:
+            np.savetxt(
+                output_path / "input_scaling",
+                [self._input_scaling]
+            )
+            saved_files['input_scaling'] = str(output_path / "input_scaling")
+
+        if self._input_baseline is not None:
+            np.savetxt(
+                output_path / "input_baseline",
+                [self._input_baseline]
+            )
+            saved_files['input_baseline'] = str(
+                output_path / "input_baseline"
+            )
+
+        if self._input_nl_pow is not None:
+            np.savetxt(
+                output_path / "input_nl_pow",
+                [self._input_nl_pow]
+            )
+            saved_files['input_nl_pow'] = str(output_path / "input_nl_pow")
+
+        # 2. Save connectivity parameters (8 files)
+        print("  [2/4] Saving connectivity parameters...")
+        conn_param_mapping = {
+            'a_EE': ('w_ee_height_learn', self._a_EE),
+            'a_EI': ('w_ei_height_learn', self._a_EI),
+            'a_IE': ('w_ie_height_learn', self._a_IE),
+            'a_II': ('w_ii_height_learn', self._a_II),
+            'd_EE': ('w_ee_width_learn', self._d_EE),
+            'd_EI': ('w_ei_width_learn', self._d_EI),
+            'd_IE': ('w_ie_width_learn', self._d_IE),
+            'd_II': ('w_ii_width_learn', self._d_II),
+        }
+
+        for param_key, (filename, value) in conn_param_mapping.items():
+            if value is not None:
+                np.savetxt(output_path / filename, [value])
+                saved_files[filename] = str(output_path / filename)
+
+        # 3. Save noise parameters (4 files)
+        print("  [3/4] Saving noise covariance parameters...")
+        if self._noise_params is not None:
+            np.savetxt(
+                output_path / "var_e_learn",
+                [self._noise_params['var_e']]
+            )
+            saved_files['var_e_learn'] = str(output_path / "var_e_learn")
+
+            np.savetxt(
+                output_path / "var_i_learn",
+                [self._noise_params['var_i']]
+            )
+            saved_files['var_i_learn'] = str(output_path / "var_i_learn")
+
+            np.savetxt(
+                output_path / "var_width_learn",
+                [self._noise_params['var_width']]
+            )
+            saved_files['var_width_learn'] = str(
+                output_path / "var_width_learn"
+            )
+
+            np.savetxt(
+                output_path / "rho_learn",
+                [self._noise_params['rho']]
+            )
+            saved_files['rho_learn'] = str(output_path / "rho_learn")
+
+        # 4. Save derived matrices (optional)
+        if save_matrices:
+            print("  [4/4] Saving derived matrices...")
+
+            # Save W
+            if self._W_exact is not None:
+                np.savetxt(output_path / "w_learn", self._W_exact)
+                saved_files['w_learn'] = str(output_path / "w_learn")
+            elif hasattr(self, '_W') and self._W is not None:
+                np.savetxt(output_path / "w_learn", self._W)
+                saved_files['w_learn'] = str(output_path / "w_learn")
+
+            # Save Sigma_eta
+            if self._Sigma_eta is not None:
+                np.savetxt(
+                    output_path / "sigma_eta_learn",
+                    self._Sigma_eta
+                )
+                saved_files['sigma_eta_learn'] = str(
+                    output_path / "sigma_eta_learn"
+                )
+
+        print(f"✓ Saved {len(saved_files)} parameter files")
+        return saved_files
+
+    def get_all_parameters(self):
+        """
+        Get all current parameter values as a dictionary.
+
+        Returns
+        -------
+        dict
+            Dictionary with all 15 parameters grouped by category
+
+        Raises
+        ------
+        ValueError
+            If model is not trained and parameters are not available
+
+        Examples
+        --------
+        >>> params = model.get_all_parameters()
+        >>> print(params['input_transformation'])
+        >>> print(params['connectivity'])
+        >>> print(params['noise'])
+        """
+        if not self._is_trained:
+            raise ValueError(
+                "Model is not trained. No parameters available."
+            )
+
+        return {
+            'input_transformation': {
+                'alpha_h': self._input_scaling,
+                'beta_h': self._input_baseline,
+                'gamma_h': self._input_nl_pow,
+            },
+            'connectivity': {
+                'a_EE': self._a_EE,
+                'a_EI': self._a_EI,
+                'a_IE': self._a_IE,
+                'a_II': self._a_II,
+                'd_EE': self._d_EE,
+                'd_EI': self._d_EI,
+                'd_IE': self._d_IE,
+                'd_II': self._d_II,
+            },
+            'noise': self._noise_params,
+            'is_trained': self._is_trained,
+            'stage1_completed': self._stage1_completed,
+            'stage2_completed': self._stage2_completed,
+        }

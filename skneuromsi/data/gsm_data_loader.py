@@ -79,7 +79,7 @@ class GSMDataLoader:
         h = np.loadtxt(self.data_path / f"h_{contrast_idx}")
         return x, h
 
-    def load_all_stimuli(self, indices=(0, 1, 2)):
+    def load_all_stimuli(self, indices=(0, 1, 2, 3, 4)):
         """
         Load all reference stimuli for specified contrast indices.
 
@@ -217,7 +217,7 @@ class GSMDataLoader:
             z_array = self.load_contrast_levels()
             assert z_array.ndim == 1, "z_array must be 1D"
 
-            for i in [0, 1, 2]:
+            for i in [0, 1, 2, 3, 4]:
                 x, h = self.load_stimulus(i)
                 assert x.shape == (256,), f"x_{i} shape {x.shape} != (256,)"
                 assert h.shape == (50,), f"h_{i} shape {h.shape} != (50,)"
