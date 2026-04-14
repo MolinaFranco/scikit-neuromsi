@@ -1,0 +1,431 @@
+@startuml classes
+set namespaceSeparator none
+class "AccessorABC" as skneuromsi.utils.accabc.AccessorABC {
+}
+class "AlaisBurr2004" as skneuromsi.mle._alais_burr2004.AlaisBurr2004 {
+  mode0
+  mode1
+  position_range
+  position_res
+  time_range
+  time_res
+  multisensory_estimator(unisensory_position_a, unisensory_position_b, unisensory_weight_a, unisensory_weight_b, multisensory_sigma, possible_locations)
+  run()
+  set_random(rng)
+  unisensory_estimator(unisensory_sigma, unisensory_position, possible_locations)
+  weight_calculator(target_sigma, reference_sigma)
+}
+class "Bunch" as skneuromsi.utils.bunch.Bunch {
+  to_dict()
+}
+class "CompressedNDResult" as skneuromsi.core.ndresult.compress.CompressedNDResult {
+  compressed_extra_keys : frozenset
+  compressed_memory_usage : object
+  compression_ratio
+  data : dict
+  original_memory_usage : object
+}
+class "Cuppini2014" as skneuromsi.neural._cuppini2014.Cuppini2014 {
+  mode0
+  mode1
+  neurons
+  position_range
+  position_res
+  random
+  s
+  tau
+  theta
+  time_range
+  time_res
+  run()
+  set_random(rng)
+}
+class "Cuppini2014Integrator" as skneuromsi.neural._cuppini2014.Cuppini2014Integrator {
+  name : str
+  s : float
+  tau : tuple
+  theta : float
+  sigmoid(u)
+}
+class "Cuppini2014TemporalFilter" as skneuromsi.neural._cuppini2014.Cuppini2014TemporalFilter {
+  name : str
+  tau : tuple
+}
+class "Cuppini2017" as skneuromsi.neural._cuppini2017.Cuppini2017 {
+  mode0
+  mode1
+  neurons
+  position_range
+  position_res
+  random
+  s
+  tau
+  theta
+  time_range
+  time_res
+  calculate_causes(multi, causes_kind, causes_dim, causes_peak_threshold, causes_peak_distance, stim_position)
+  run()
+  set_random(rng)
+}
+class "Cuppini2017Integrator" as skneuromsi.neural._cuppini2017.Cuppini2017Integrator {
+  name : str
+  s : float
+  tau : tuple
+  theta : float
+  sigmoid(u)
+}
+class "CustomJSONEncoder" as skneuromsi.utils.custom_json.CustomJSONEncoder {
+  CONVERTERS : tuple
+  default(obj)
+}
+class "DeviceConfig" as skneuromsi.neural._device_config.DeviceConfig {
+  brainpy_available : bool
+  device : Literal
+  jax_available : bool
+  jax_gpu_available : bool
+  get_info() -> str
+  get_jax_devices() -> List
+  setup() -> bool
+}
+class "Echeveste2020" as skneuromsi.neural._echeveste2020.Echeveste2020 {
+  N_E
+  N_I
+  position_range
+  position_res
+  time_range
+  time_res
+  build_connectivity_matrix(connectivity_params)
+  burn_in(W, h, u_init, Sigma_eta, burn_in_time, eta_init)
+  calculate_causes(network_activity, stimulus, contrast_range)
+  generate_stimulus_from_gsm(contrast, n_samples)
+  get_all_parameters()
+  is_trained()
+  load_parameters(load_exact_matrices)
+  parametric_connectivity(theta_i, theta_j, a_xy, d_xy)
+  run()
+  save_parameters(output_dir, save_matrices)
+  set_random(rng)
+  train(gsm_model, stage1_params, stage2_params)
+}
+class "EchevesteDataLoader" as skneuromsi.data.echeveste_data_loader.EchevesteDataLoader {
+  data_path
+  build_noise_covariance_from_parameters(var_e, var_i, var_width, rho, n_orientations, epsilon)
+  get_data_info()
+  load_all_data()
+  load_all_gsm_data()
+  load_all_ssn_data()
+  load_connectivity_matrix()
+  load_exact_connectivity_matrix()
+  load_gabor_filters()
+  load_input_transformation_parameters()
+  load_noise_covariance(fallback_to_construction)
+  load_noise_variance_parameters()
+  load_prior_covariance()
+  load_ssn_connectivity_parameters()
+  validate_data_integrity()
+}
+class "GSM" as skneuromsi.generative._gsm.GSM {
+  A : ndarray
+  ATA
+  C : ndarray
+  C_inv
+  W_ff
+  alpha_h : float
+  bandwidth : float
+  beta_h : float
+  correlation_strength : float
+  gamma : float
+  gamma_h : float
+  h_scale : float
+  n_orientations : int
+  noise_variance : float
+  orientation_dim : int
+  patch_dim : int
+  patch_size : int
+  spatial_freq : float
+  use_pretrained : bool
+  compute_input_baseline_lb(stimuli, n_samples, contrasts)
+  compute_posterior_for_ssn_training(contrast, n_samples, z_map, apply_transformation)
+  compute_posterior_moments(x, z_map, add_baseline)
+  generate_bump_stimulus(dominant_orientation_idx, amplitude, width_factor, normalize)
+  generate_h_input(x)
+  generate_h_input_efficient(x)
+  generate_h_input_raw(x)
+  generate_stimuli(contrasts, n_samples)
+  generate_stimulus_from_y(y, contrast, add_noise)
+  generate_stimulus_patch(contrast, add_noise, y, mode, y_mean)
+  get_gabor_filters()
+  get_h_for_contrast_level(contrast_level, n_samples)
+  get_prior_covariance()
+  load_precomputed_h_transformed(contrast_idx)
+  set_random(random_seed)
+}
+class "GSMDataLoader" as skneuromsi.data.gsm_data_loader.GSMDataLoader {
+  data_path
+  load_all_stimuli(indices)
+  load_contrast_levels()
+  load_gabor_filters()
+  load_h_vec_transformed(contrast_idx)
+  load_prior_covariance()
+  load_stimulus(contrast_idx)
+  load_transformation_parameters()
+  validate_data_integrity()
+}
+class "Kording2007" as skneuromsi.bayesian._kording2007.Kording2007 {
+  mode0
+  mode1
+  n
+  position_range
+  position_res
+  random
+  time_range
+  time_res
+  calculate_causes(mean_p_common_cause, causes_kind)
+  input_computation(unisensory_position, unisensory_var, noise)
+  multisensory_estimator(auditory_estimate, visual_estimate, auditory_var, visual_var, prior_var, prior_mu, multisensory_var, multisensory_var_hat, n, auditory_ind_var, visual_ind_var, p_common, strategy, possible_locations, auditory_input, visual_input)
+  run()
+  set_random(rng)
+  unisensory_estimator(unisensory_var, unisensory_var_hat, prior_var, prior_mu, unisensory_input)
+}
+class "<color:red>MaybeTooBigForAvailableMemoryWarning</color>" as skneuromsi.sweep.MaybeTooBigForAvailableMemoryWarning {
+}
+class "NDCollectionProcessingStrategy" as skneuromsi.sweep.NDCollectionProcessingStrategy {
+  map(result)
+  reduce(result_sequence, tag, tqdm_cls)
+}
+class "NDResult" as skneuromsi.core.ndresult.result.NDResult {
+  causes_
+  dims
+  e_
+  extra_
+  get_pcoords
+  mname
+  modes_
+  mtype
+  nmap_
+  output_mode
+  pcoords_
+  plot
+  position_range
+  position_res
+  positions_
+  positions_coordinates_
+  rp
+  run_parameters
+  stats
+  time_range
+  time_res
+  times_
+  astype(dtype)
+  deep_dtypes()
+  dtypes()
+  from_modes_dict()
+  get_modes()
+  get_positions()
+  get_positions_coordinates()
+  get_times()
+  to_dict()
+  to_ndr(path_or_stream, metadata)
+  to_xarray()
+}
+class "NDResultCollection" as skneuromsi.ndcollection.collection.NDResultCollection {
+  bias
+  causes
+  causes_
+  dims_
+  input_modes_
+  modes_
+  name
+  output_mode_
+  plot
+  run_parameters_
+  run_parameters_values
+  tqdm_cls
+  changing_parameters()
+  coerce_dimension(prefer)
+  coerce_mode(prefer)
+  coerce_parameter(prefer)
+  disparity_matrix()
+  from_ndresults(name, results)
+  modes_variance_sum()
+  to_ndc(path_or_stream, metadata, quiet)
+}
+class "NDResultCollectionBiasAcc" as skneuromsi.ndcollection.bias_acc.NDResultCollectionBiasAcc {
+  bias(influence_parameter)
+  bias_mean(influence_parameter)
+}
+class "NDResultCollectionCausesAcc" as skneuromsi.ndcollection.causes_acc.NDResultCollectionCausesAcc {
+  causes_by_parameter()
+  describe_causes()
+  mean_report()
+  n_report(n)
+  unique_causes()
+  unity_report()
+}
+class "NDResultCollectionPlotter" as skneuromsi.ndcollection.cplot_acc.NDResultCollectionPlotter {
+  bias(influence_parameter)
+  mean_report()
+  n_report(n)
+  unity_report()
+}
+class "ParameterAliasTemplate" as skneuromsi.core.modelabc.ParameterAliasTemplate {
+  doc_pattern : Optional[str]
+  target : str
+  template : Template
+  template_variables : frozenset
+  render(context) -> str
+}
+class "ParameterSweep" as skneuromsi.sweep.ParameterSweep {
+  expected_result_length_
+  mem_error_ratio
+  mem_warning_ratio
+  model
+  n_jobs
+  processing_strategy
+  random_
+  range
+  repeat
+  target
+  tqdm_cls
+  run()
+}
+class "Paredes2025" as skneuromsi.neural._paredes2025.Paredes2025 {
+  mode0
+  mode1
+  neurons
+  position_range
+  position_res
+  random
+  s
+  tau
+  tau_neurons
+  theta
+  time_range
+  time_res
+  calculate_causes(multi, causes_kind, causes_dim, causes_peak_threshold, causes_peak_distance, stim_position)
+  run()
+  set_random(rng)
+}
+class "Paredes2025Integrator" as skneuromsi.neural._paredes2025.Paredes2025Integrator {
+  name : str
+  s : float
+  tau : tuple
+  theta : float
+  sigmoid(u)
+}
+class "Paredes2025TemporalFilter" as skneuromsi.neural._paredes2025.Paredes2025TemporalFilter {
+  name : str
+  tau : tuple
+}
+class "ProcessingStrategyABC" as skneuromsi.sweep.ProcessingStrategyABC {
+  {abstract}map(result)
+  {abstract}reduce(result_sequence, tag, tqdm_cls)
+}
+class "ResultPlotter" as skneuromsi.core.ndresult.plot_acc.ResultPlotter {
+  linep
+  linet
+  line_positions(time)
+  line_times(position)
+}
+class "ResultStatsAccessor" as skneuromsi.core.ndresult.stats_acc.ResultStatsAccessor {
+  count()
+  describe(percentiles)
+  dimmax()
+  dimmin()
+  max()
+  mean()
+  min()
+  quantile(q)
+  std()
+}
+class "SKNMSIMethodABC" as skneuromsi.core.modelabc.SKNMSIMethodABC {
+  calculate_causes()
+}
+class "SKNMSIRunConfig" as skneuromsi.core.modelabc.SKNMSIRunConfig {
+  input_targets
+  output_targets
+  template_variables
+  from_method_class(method_class)
+  get_model_state(instance)
+  make_run_input_alias_map(context)
+  make_run_output_alias_map(context)
+  set_model_state(instance, state)
+  validate_init_and_run(method_class)
+  wrap_init(init_method)
+  wrap_run(model_instance, run_template_context)
+}
+class "SSNIntegrator" as skneuromsi.neural._echeveste2020.SSNIntegrator {
+  k : float
+  n : float
+  name : str
+  tau_e : float
+  tau_i : float
+  tau_n : float
+  supralinear_activation(u)
+}
+class "<color:red>ToBigForAvailableMemoryError</color>" as skneuromsi.sweep.ToBigForAvailableMemoryError {
+}
+class "Zhu2024" as skneuromsi.bayesian._zhu2024.Zhu2024 {
+  mode0
+  mode1
+  n
+  numerosity_range
+  numerosity_res
+  position_range
+  position_res
+  random
+  time_range
+  time_res
+  calculate_causes(mean_p_common_cause, causes_kind)
+  input_computation(value, variance, noise)
+  multisensory_estimator(aud_num, vis_num, aud_time, vis_time, aud_num_sigma, vis_num_sigma, aud_time_sigma, vis_time_sigma, prior_num_mu, prior_num_sigma, prior_time_mu, prior_time_sigma, p_common, strategy, numerosity_possible, time_possible, est_aud_num_ind, est_vis_num_ind, est_aud_time_ind, est_vis_time_ind)
+  run()
+  set_random(rng)
+  unisensory_estimator(value, sigma, prior_mu, prior_sigma)
+}
+class "_Compression" as skneuromsi.io._Compression {
+  COMPRESSION : int
+  COMPRESS_LEVEL : int
+}
+class "_Keys" as skneuromsi.io._Keys {
+  EXTRA_METADATA_KEYS : str
+  OBJ_KWARGS_KEY : str
+  OBJ_SIZE_KEY : str
+  OBJ_TYPE_KEY : str
+  UTC_TIMESTAMP_KEY : str
+}
+class "_MemoryImpact" as skneuromsi.utils.memtools._MemoryImpact {
+  available_ratio
+  expected_size : int
+  havailable_memory
+  hexpected_size
+  htotal_memory
+  total_ratio
+  vmem : object
+}
+class "_MemoryUsage" as skneuromsi.utils.memtools._MemoryUsage {
+  hsize
+  size : int
+}
+class "_ObjTypes" as skneuromsi.io._ObjTypes {
+  NDCOLLETION_TYPE : str
+  NDRESULT_TYPE : str
+}
+class "_ZipFileNames" as skneuromsi.io._ZipFileNames {
+  METADATA : str
+  NDDATA : str
+}
+skneuromsi.bayesian._kording2007.Kording2007 --|> skneuromsi.core.modelabc.SKNMSIMethodABC
+skneuromsi.bayesian._zhu2024.Zhu2024 --|> skneuromsi.core.modelabc.SKNMSIMethodABC
+skneuromsi.core.ndresult.plot_acc.ResultPlotter --|> skneuromsi.utils.accabc.AccessorABC
+skneuromsi.core.ndresult.stats_acc.ResultStatsAccessor --|> skneuromsi.utils.accabc.AccessorABC
+skneuromsi.mle._alais_burr2004.AlaisBurr2004 --|> skneuromsi.core.modelabc.SKNMSIMethodABC
+skneuromsi.ndcollection.bias_acc.NDResultCollectionBiasAcc --|> skneuromsi.utils.accabc.AccessorABC
+skneuromsi.ndcollection.causes_acc.NDResultCollectionCausesAcc --|> skneuromsi.utils.accabc.AccessorABC
+skneuromsi.ndcollection.cplot_acc.NDResultCollectionPlotter --|> skneuromsi.utils.accabc.AccessorABC
+skneuromsi.neural._cuppini2014.Cuppini2014 --|> skneuromsi.core.modelabc.SKNMSIMethodABC
+skneuromsi.neural._cuppini2017.Cuppini2017 --|> skneuromsi.core.modelabc.SKNMSIMethodABC
+skneuromsi.neural._echeveste2020.Echeveste2020 --|> skneuromsi.core.modelabc.SKNMSIMethodABC
+skneuromsi.neural._paredes2025.Paredes2025 --|> skneuromsi.core.modelabc.SKNMSIMethodABC
+skneuromsi.sweep.NDCollectionProcessingStrategy --|> skneuromsi.sweep.ProcessingStrategyABC
+@enduml

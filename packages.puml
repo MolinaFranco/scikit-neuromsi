@@ -1,0 +1,26 @@
+@startuml packages
+set namespaceSeparator none
+package "skneuromsi.neural" as skneuromsi.neural {
+}
+package "skneuromsi.neural._cuppini2014" as skneuromsi.neural._cuppini2014 {
+}
+package "skneuromsi.neural._cuppini2017" as skneuromsi.neural._cuppini2017 {
+}
+package "skneuromsi.neural._device_config" as skneuromsi.neural._device_config {
+}
+package "skneuromsi.neural._echeveste2020" as skneuromsi.neural._echeveste2020 {
+}
+package "skneuromsi.neural._echeveste_training" as skneuromsi.neural._echeveste_training {
+}
+package "skneuromsi.neural._echeveste_visualization" as skneuromsi.neural._echeveste_visualization {
+}
+package "skneuromsi.neural._paredes2025" as skneuromsi.neural._paredes2025 {
+}
+skneuromsi.neural --> skneuromsi.neural._cuppini2014
+skneuromsi.neural --> skneuromsi.neural._cuppini2017
+skneuromsi.neural --> skneuromsi.neural._device_config
+skneuromsi.neural --> skneuromsi.neural._echeveste2020
+skneuromsi.neural --> skneuromsi.neural._paredes2025
+skneuromsi.neural._echeveste2020 --> skneuromsi.neural._device_config
+skneuromsi.neural._echeveste2020 --> skneuromsi.neural._echeveste_training
+@enduml
